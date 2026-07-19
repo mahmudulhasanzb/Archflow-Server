@@ -2,7 +2,7 @@ import express, { type Express, type Request, type Response, type NextFunction }
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient, Db, ObjectId } from 'mongodb';
-import { jwtVerify } from 'jose-cjs';
+import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
 
 dotenv.config();
 
@@ -40,17 +40,9 @@ async function connectDB() {
 
 connectDB();
 
-// JWT Verification helper using jose-cjs
-async function verifyJWT(token: string) {
-  const secretKey = process.env.JWT_SECRET || 'zXv2IGCUk0pXzaQ5ejPy6zGw4bQpeEHA';
-  const secret = new TextEncoder().encode(secretKey);
-  try {
-    const { payload } = await jwtVerify(token, secret);
-    return payload;
-  } catch (err) {
-    return null;
-  }
-}
+// JWT JWKS Verification helper using jose-cjs
+const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+const JWKS = createRemoteJWKSet(new URL(`${clientUrl}/api/auth/jwks`));
 
 // Auth Request interface
 export interface AuthRequest extends Request {
@@ -58,6 +50,7 @@ export interface AuthRequest extends Request {
     id: string;
     email: string;
     role?: string;
+    [key: string]: any;
   };
 }
 
@@ -84,41 +77,10 @@ export async function authMiddleware(req: AuthRequest, res: Response, next: Next
   }
 
   if (!token) {
-    return res.status(401).json({ error: 'Unauthorized: No token provided' });
+    return res.status(401).json({ msg: 'Unauthorized: No token provided' });
   }
 
-  // 3. Verify JWT using jose-cjs
-  const jwtPayload = await verifyJWT(token);
-  if (jwtPayload) {
-    req.user = {
-      id: (jwtPayload.sub || jwtPayload.id) as string,
-      email: jwtPayload.email as string,
-      role: (jwtPayload.role || 'user') as string
-    };
-    return next();
-  }
-
-  // 4. Verify better-auth session from database
-  if (db) {
-    try {
-      const sessionDoc = await db.collection('session').findOne({ token });
-      if (sessionDoc) {
-        const userDoc = await db.collection('user').findOne({ _id: new ObjectId(sessionDoc.userId) });
-        if (userDoc) {
-          req.user = {
-            id: userDoc._id.toString(),
-            email: userDoc.email,
-            role: userDoc.role || 'user'
-          };
-          return next();
-        }
-      }
-    } catch (err) {
-      console.error('Session verification database error:', err);
-    }
-  }
-
-  // 5. Hardcoded bypass for Demo Mode
+  // 3. Hardcoded bypass for Demo Mode
   if (token === 'demo-session-token') {
     req.user = {
       id: 'demo-user',
@@ -128,7 +90,40 @@ export async function authMiddleware(req: AuthRequest, res: Response, next: Next
     return next();
   }
 
-  return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+  // 4. Verify token using JWKS public keys
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    req.user = {
+      id: (payload.sub || payload.id) as string,
+      email: payload.email as string,
+      role: (payload.role || 'user') as string,
+      ...payload
+    };
+    return next();
+  } catch (error: any) {
+    // 5. Database fallback check if JWKS fails (e.g. offline or raw DB sessions)
+    if (db) {
+      try {
+        const sessionDoc = await db.collection('session').findOne({ token });
+        if (sessionDoc) {
+          const userDoc = await db.collection('user').findOne({ _id: new ObjectId(sessionDoc.userId) });
+          if (userDoc) {
+            req.user = {
+              id: userDoc._id.toString(),
+              email: userDoc.email,
+              role: userDoc.role || 'user'
+            };
+            return next();
+          }
+        }
+      } catch (dbErr) {
+        console.error('Session verification database error:', dbErr);
+      }
+    }
+    
+    console.error('JWT JWKS validation failed:', error.message);
+    return res.status(401).json({ msg: 'Unauthorized' });
+  }
 }
 
 // API Health Check
