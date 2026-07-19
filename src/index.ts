@@ -1,59 +1,77 @@
-import express, { type Express, type Request, type Response, type NextFunction } from 'express';
+import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient, Db, ObjectId } from 'mongodb';
 import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
 
-// Helper to safely convert strings to ObjectId resolving type checks
-function toObjectId(id: any): ObjectId {
-  if (Array.isArray(id)) {
-    return new ObjectId(id[0]);
-  }
-  return new ObjectId(String(id));
-}
-
 dotenv.config();
 
-const app: Express = express();
-const port = process.env.PORT || 5000;
+const app = express();
+const PORT = process.env.PORT || 5000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/archflow';
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
 
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
-  credentials: true
-}));
+const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
+
+// Middlewares
+app.use(
+  cors({
+    origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
+    credentials: true,
+  }),
+);
 
 app.use(express.json());
 
-// MongoDB connection with fallback
-export let db: Db | null = null;
+// Database connection with fallback
+let db: Db | null = null;
 let client: MongoClient | null = null;
 
 async function connectDB() {
   const mongoUri = process.env.MONGODB_URI;
   if (!mongoUri) {
-    console.warn("MONGODB_URI is not defined in environment variables. Falling back to in-memory mode.");
+    console.warn(
+      'MONGODB_URI is not defined in environment variables. Falling back to in-memory mode.',
+    );
     return;
   }
-
   try {
     client = new MongoClient(mongoUri);
     await client.connect();
     db = client.db();
-    console.log("Connected to MongoDB successfully.");
+    console.log('Successfully connected to MongoDB.');
   } catch (error: any) {
-    console.error("Failed to connect to MongoDB, falling back to in-memory mode. Error:", error.message);
+    console.error(
+      'Failed to connect to MongoDB, falling back to in-memory mode. Error:',
+      error.message,
+    );
     db = null;
   }
 }
 
 connectDB();
 
-// JWT JWKS Verification helper using jose-cjs
-const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
-const JWKS = createRemoteJWKSet(new URL(`${clientUrl}/api/auth/jwks`));
+// Interfaces matching database schema
+export interface Blueprint {
+  _id?: any;
+  title: string;
+  shortDescription: string;
+  description: string;
+  stack: string;
+  creatorId: string;
+  status: 'Generating' | 'Ready';
+  currentStep: 'Architect' | 'Planner' | 'Documenter' | 'Reviewer' | 'Ready';
+  createdAt: string;
+  rating: number;
+  steps: {
+    Architect: { content: string; status: 'pending' | 'completed' };
+    Planner: { content: string; status: 'pending' | 'completed' };
+    Documenter: { content: string; status: 'pending' | 'completed' };
+    Reviewer: { content: string; status: 'pending' | 'completed' };
+  };
+}
 
-// Auth Request interface
-export interface AuthRequest extends Request {
+export interface AuthRequest extends express.Request {
   user?: {
     id: string;
     email: string;
@@ -62,80 +80,16 @@ export interface AuthRequest extends Request {
   };
 }
 
-// Authentication Middleware matching techbazaar verifyToken style
-export async function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
-  let token = '';
-
-  // 1. Read from Authorization Header
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.split(' ')[1];
+// Helpers
+function toObjectId(id: any): ObjectId {
+  if (Array.isArray(id)) {
+    return new ObjectId(id[0]);
   }
-
-  // 2. Read from Cookies
-  if (!token && req.headers.cookie) {
-    const cookies = req.headers.cookie.split(';').reduce((acc: any, cur: string) => {
-      const parts = cur.split('=');
-      if (parts[0]) {
-        acc[parts[0].trim()] = parts[1]?.trim();
-      }
-      return acc;
-    }, {});
-    token = cookies['better-auth.session_token'] || cookies['session_token'] || '';
-  }
-
-  if (!token) {
-    return res.status(401).json({ msg: 'Unauthorized: No token provided' });
-  }
-
-  // 3. Hardcoded bypass for Demo Mode
-  if (token === 'demo-session-token') {
-    req.user = {
-      id: 'demo-user',
-      email: 'demo@archflow.com',
-      role: 'user'
-    };
-    return next();
-  }
-
-  // 4. Verify token using JWKS public keys
-  try {
-    const { payload } = await jwtVerify(token, JWKS);
-    req.user = {
-      id: (payload.sub || payload.id) as string,
-      email: payload.email as string,
-      role: (payload.role || 'user') as string,
-      ...payload
-    };
-    return next();
-  } catch (error: any) {
-    // 5. Database fallback check if JWKS fails (e.g. offline or raw DB sessions)
-    if (db) {
-      try {
-        const sessionDoc = await db.collection('session').findOne({ token });
-        if (sessionDoc) {
-          const userDoc = await db.collection('user').findOne({ _id: toObjectId(sessionDoc.userId) });
-          if (userDoc) {
-            req.user = {
-              id: userDoc._id.toString(),
-              email: userDoc.email,
-              role: userDoc.role || 'user'
-            };
-            return next();
-          }
-        }
-      } catch (dbErr) {
-        console.error('Session verification database error:', dbErr);
-      }
-    }
-    
-    console.error('JWT JWKS validation failed:', error.message);
-    return res.status(401).json({ msg: 'Unauthorized' });
-  }
+  return new ObjectId(String(id));
 }
 
 // In-Memory Blueprint store fallback
-const inMemoryBlueprints: any[] = [];
+const inMemoryBlueprints: Blueprint[] = [];
 
 // Helper functions for common blueprint schema generation
 function getArchitectContent(title: string, description: string, stack: string) {
@@ -207,54 +161,56 @@ Generated by **Reviewer Agent** for **${title}**.
 // Simulated Agent pipeline runner
 async function runAgentPipeline(blueprintId: string) {
   const delay = 2000;
-  
+
   // Find blueprint
   let bp: any = null;
   if (db) {
     try {
-      bp = await db.collection('blueprints').findOne({ _id: new ObjectId(blueprintId) });
-    } catch(e) {}
+      bp = await db
+        .collection('blueprints')
+        .findOne({ _id: new ObjectId(blueprintId) });
+    } catch (e) {}
   } else {
-    bp = inMemoryBlueprints.find(b => b._id === blueprintId);
+    bp = inMemoryBlueprints.find((b) => b._id === blueprintId);
   }
-  
+
   if (!bp) return;
 
   // Step 1: Architect
-  await new Promise(resolve => setTimeout(resolve, delay));
+  await new Promise((resolve) => setTimeout(resolve, delay));
   await updateBlueprintStep(blueprintId, 'Planner', {
     'steps.Architect': {
       content: getArchitectContent(bp.title, bp.description, bp.stack),
-      status: 'completed'
-    }
+      status: 'completed',
+    },
   });
 
   // Step 2: Planner
-  await new Promise(resolve => setTimeout(resolve, delay));
+  await new Promise((resolve) => setTimeout(resolve, delay));
   await updateBlueprintStep(blueprintId, 'Documenter', {
     'steps.Planner': {
       content: getPlannerContent(bp.title),
-      status: 'completed'
-    }
+      status: 'completed',
+    },
   });
 
   // Step 3: Documenter
-  await new Promise(resolve => setTimeout(resolve, delay));
+  await new Promise((resolve) => setTimeout(resolve, delay));
   await updateBlueprintStep(blueprintId, 'Reviewer', {
     'steps.Documenter': {
       content: getDocumenterContent(bp.title, bp.stack),
-      status: 'completed'
-    }
+      status: 'completed',
+    },
   });
 
   // Step 4: Reviewer -> Ready
-  await new Promise(resolve => setTimeout(resolve, delay));
+  await new Promise((resolve) => setTimeout(resolve, delay));
   await updateBlueprintStep(blueprintId, 'Ready', {
     'steps.Reviewer': {
       content: getReviewerContent(bp.title),
-      status: 'completed'
+      status: 'completed',
     },
-    status: 'Ready'
+    status: 'Ready',
   });
   console.log(`Pipeline finished for blueprint: ${blueprintId}`);
 }
@@ -262,94 +218,194 @@ async function runAgentPipeline(blueprintId: string) {
 async function updateBlueprintStep(id: string, nextStep: string, updates: any) {
   if (db) {
     try {
-      await db.collection('blueprints').updateOne(
-        { _id: toObjectId(id) },
-        { $set: { currentStep: nextStep, ...updates } }
-      );
-    } catch(e) {
+      await db
+        .collection('blueprints')
+        .updateOne(
+          { _id: toObjectId(id) },
+          { $set: { currentStep: nextStep, ...updates } },
+        );
+    } catch (e) {
       console.error('MongoDB update error:', e);
     }
   } else {
-    const bp = inMemoryBlueprints.find(b => b._id === id);
+    const bp = inMemoryBlueprints.find((b) => b._id === id);
     if (bp) {
       bp.currentStep = nextStep;
       for (const key in updates) {
         if (key.includes('.')) {
           const [parent, child] = key.split('.');
-          bp[parent][child] = updates[key];
+          (bp as any)[parent][child] = updates[key];
         } else {
-          bp[key] = updates[key];
+          (bp as any)[key] = updates[key];
         }
       }
     }
   }
 }
 
+// Token verification middleware
+export const verifyToken = async (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) => {
+  let token = '';
+
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  }
+
+  if (!token && req.headers.cookie) {
+    const cookies = req.headers.cookie
+      .split(';')
+      .reduce((acc: any, cur: string) => {
+        const parts = cur.split('=');
+        if (parts[0]) {
+          acc[parts[0].trim()] = parts[1]?.trim();
+        }
+        return acc;
+      }, {});
+    token = cookies['better-auth.session_token'] || cookies['session_token'] || '';
+  }
+
+  if (!token) {
+    res.status(401).json({ msg: 'Unauthorized: No token provided' });
+    return;
+  }
+
+  if (token === 'demo-session-token') {
+    (req as AuthRequest).user = {
+      id: 'demo-user',
+      email: 'demo@archflow.com',
+      role: 'user',
+    };
+    next();
+    return;
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    (req as AuthRequest).user = {
+      id: (payload.sub || payload.id) as string,
+      email: payload.email as string,
+      role: (payload.role || 'user') as string,
+      ...payload,
+    };
+    next();
+  } catch (error: any) {
+    if (db) {
+      try {
+        const sessionDoc = await db.collection('session').findOne({ token });
+        if (sessionDoc) {
+          const userDoc = await db
+            .collection('user')
+            .findOne({ _id: toObjectId(sessionDoc.userId) });
+          if (userDoc) {
+            (req as AuthRequest).user = {
+              id: userDoc._id.toString(),
+              email: userDoc.email,
+              role: userDoc.role || 'user',
+            };
+            next();
+            return;
+          }
+        }
+      } catch (dbErr) {
+        console.error('Session verification database error:', dbErr);
+      }
+    }
+    console.error('Token verification failed:', error.message);
+    res.status(401).json({ msg: 'Unauthorized' });
+  }
+};
+
+// Alias authMiddleware to verifyToken for external compatibility
+export const authMiddleware = verifyToken;
+
 // API Routes
 
-// API Health Check
-app.get('/api/health', (req: Request, res: Response) => {
+// GET /api/health - Health check endpoint
+app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    database: db ? 'mongodb' : 'memory'
+    database: db ? 'mongodb' : 'memory',
   });
 });
 
-// Protected Profile Endpoint
-app.get('/api/auth/me', authMiddleware as any, (req: AuthRequest, res: Response) => {
-  res.json({ user: req.user });
+// GET /api/auth/me - Protected Profile Endpoint
+app.get('/api/auth/me', verifyToken, (req, res) => {
+  res.json({ user: (req as AuthRequest).user });
 });
 
 // GET /api/blueprints - Fetch blueprints (optional creatorId filter)
-app.get('/api/blueprints', async (req: Request, res: Response) => {
+app.get('/api/blueprints', async (req, res) => {
   const creatorId = req.query.creatorId as string;
   try {
     if (db) {
       const filter = creatorId ? { creatorId } : {};
-      const list = await db.collection('blueprints').find(filter).sort({ createdAt: -1 }).toArray();
-      return res.json(list);
+      const list = await db
+        .collection('blueprints')
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json(list);
     } else {
       let list = [...inMemoryBlueprints];
       if (creatorId) {
-        list = list.filter(b => b.creatorId === creatorId);
+        list = list.filter((b) => b.creatorId === creatorId);
       }
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      return res.json(list);
+      list.sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      );
+      res.json(list);
     }
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // GET /api/blueprints/:id - Fetch blueprint details
-app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
-  const id = req.params.id;
+app.get('/api/blueprints/:id', async (req, res) => {
+  const { id } = req.params;
   try {
     if (db) {
       try {
-        const bp = await db.collection('blueprints').findOne({ _id: toObjectId(id) });
-        if (!bp) return res.status(404).json({ error: 'Blueprint not found' });
-        return res.json(bp);
+        const bp = await db
+          .collection('blueprints')
+          .findOne({ _id: toObjectId(id) });
+        if (!bp) {
+          res.status(404).json({ error: 'Blueprint not found' });
+          return;
+        }
+        res.json(bp);
       } catch (e) {
-        return res.status(400).json({ error: 'Invalid blueprint ID format' });
+        res.status(400).json({ error: 'Invalid blueprint ID format' });
       }
     } else {
-      const bp = inMemoryBlueprints.find(b => b._id === id);
-      if (!bp) return res.status(404).json({ error: 'Blueprint not found' });
-      return res.json(bp);
+      const bp = inMemoryBlueprints.find((b) => b._id === id);
+      if (!bp) {
+        res.status(404).json({ error: 'Blueprint not found' });
+        return;
+      }
+      res.json(bp);
     }
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // POST /api/blueprints - Create new blueprint and trigger pipeline
-app.post('/api/blueprints', authMiddleware as any, async (req: AuthRequest, res: Response) => {
+app.post('/api/blueprints', verifyToken, async (req, res) => {
   const { title, shortDescription, description, stack } = req.body;
-  const creatorId = req.user?.id || 'demo-user';
+  const creatorId = (req as AuthRequest).user?.id || 'demo-user';
 
   if (!title || !description || !shortDescription) {
-    return res.status(400).json({ error: 'Missing required title, description or shortDescription fields.' });
+    res.status(400).json({
+      error: 'Missing required title, description or shortDescription fields.',
+    });
+    return;
   }
 
   const newBlueprint = {
@@ -358,16 +414,16 @@ app.post('/api/blueprints', authMiddleware as any, async (req: AuthRequest, res:
     description,
     stack: stack || 'Next.js + Express + MongoDB',
     creatorId,
-    status: 'Generating',
-    currentStep: 'Architect',
+    status: 'Generating' as const,
+    currentStep: 'Architect' as const,
     createdAt: new Date().toISOString(),
     rating: parseFloat((4.5 + Math.random() * 0.4).toFixed(1)),
     steps: {
-      Architect: { content: '', status: 'pending' },
-      Planner: { content: '', status: 'pending' },
-      Documenter: { content: '', status: 'pending' },
-      Reviewer: { content: '', status: 'pending' }
-    }
+      Architect: { content: '', status: 'pending' as const },
+      Planner: { content: '', status: 'pending' as const },
+      Documenter: { content: '', status: 'pending' as const },
+      Reviewer: { content: '', status: 'pending' as const },
+    },
   };
 
   try {
@@ -375,59 +431,66 @@ app.post('/api/blueprints', authMiddleware as any, async (req: AuthRequest, res:
       const result = await db.collection('blueprints').insertOne(newBlueprint);
       const insertedId = result.insertedId.toString();
       const createdBp = { ...newBlueprint, _id: insertedId };
-      // Trigger background simulation
       runAgentPipeline(insertedId);
-      return res.status(201).json(createdBp);
+      res.status(201).json(createdBp);
     } else {
       const mockId = 'bp_' + Math.random().toString(36).substr(2, 9);
       const createdBp = { ...newBlueprint, _id: mockId };
       inMemoryBlueprints.push(createdBp);
-      // Trigger background simulation
       runAgentPipeline(mockId);
-      return res.status(201).json(createdBp);
+      res.status(201).json(createdBp);
     }
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // DELETE /api/blueprints/:id - Delete a blueprint
-app.delete('/api/blueprints/:id', authMiddleware as any, async (req: AuthRequest, res: Response) => {
-  const id = req.params.id;
-  const userId = req.user?.id || 'demo-user';
+app.delete('/api/blueprints/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const userId = (req as AuthRequest).user?.id || 'demo-user';
   try {
     if (db) {
       try {
-        const bp = await db.collection('blueprints').findOne({ _id: toObjectId(id) });
-        if (!bp) return res.status(404).json({ error: 'Blueprint not found' });
-        
-        // Authorization check: creator only, bypass check for demo-user
-        if (bp.creatorId !== userId && userId !== 'demo-user') {
-          return res.status(403).json({ error: 'Forbidden: You did not create this blueprint.' });
+        const bp = await db
+          .collection('blueprints')
+          .findOne({ _id: toObjectId(id) });
+        if (!bp) {
+          res.status(404).json({ error: 'Blueprint not found' });
+          return;
         }
-        
+
+        if (bp.creatorId !== userId && userId !== 'demo-user') {
+          res.status(403).json({ error: 'Forbidden: You did not create this blueprint.' });
+          return;
+        }
+
         await db.collection('blueprints').deleteOne({ _id: toObjectId(id) });
-        return res.json({ message: 'Blueprint deleted successfully' });
+        res.json({ message: 'Blueprint deleted successfully' });
       } catch (e) {
-        return res.status(400).json({ error: 'Invalid ID format' });
+        res.status(400).json({ error: 'Invalid ID format' });
       }
     } else {
-      const idx = inMemoryBlueprints.findIndex(b => b._id === id);
-      if (idx === -1) return res.status(404).json({ error: 'Blueprint not found' });
-      
+      const idx = inMemoryBlueprints.findIndex((b) => b._id === id);
+      if (idx === -1) {
+        res.status(404).json({ error: 'Blueprint not found' });
+        return;
+      }
+
       const bp = inMemoryBlueprints[idx];
       if (bp.creatorId !== userId && userId !== 'demo-user') {
-        return res.status(403).json({ error: 'Forbidden: You did not create this blueprint.' });
+        res.status(403).json({ error: 'Forbidden: You did not create this blueprint.' });
+        return;
       }
-      
+
       inMemoryBlueprints.splice(idx, 1);
-      return res.json({ message: 'Blueprint deleted successfully' });
+      res.json({ message: 'Blueprint deleted successfully' });
     }
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
