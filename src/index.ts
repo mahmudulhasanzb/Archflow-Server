@@ -2,6 +2,7 @@ import express, { type Request, type Response } from 'express';
 import { MongoClient, Db } from 'mongodb';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { features } from 'node:process';
 // import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
 // import Stripe from 'stripe';
 
@@ -20,8 +21,34 @@ const MONGODB_URI = process.env.MONGODB_URI as string;
 
 // const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
 
+const blueprintsCollection = [
+  {
+    title: 'Blueprint title',
+    description: 'description',
+    teckStack: ['Nextjs', 'React', 'MongoDB'],
+    complexcity: 'medium',
+    architectureFlow: {
+      architecture: {
+       
+            title: 'Architecture step 1',
+            description: 'Architecture step 1 description',
+      },
+      features: {
+            title: 'Features step 1',
+            description: 'Features step 1 description',
+      },
+      plan: {
+            title: 'Plan step 1',
+            description: 'Plan step 1 description',
+          }
+    },
+    status: 'ready',
+    rating: 5,
+    author: 'hasan@gmail.com',
+  },
+];
 
-
+// ── MongoDB connection ─────────────────────────────
 if (!MONGODB_URI) {
   throw new Error(
     'Please define the MONGODB_URI environment variable inside .env',
@@ -45,6 +72,22 @@ export async function connectToDatabase(): Promise<Db> {
   }
 }
 
+// routes
+
+app.get('/api/all-blueprints', async (req: Request, res: Response) => {
+  try {
+    const blueprints = blueprintsCollection;
+    res.status(200).json(blueprints);
+  } catch (error) {
+    console.error('Failed to get blueprints:', error);
+    res.status(500).json({ error: 'Failed to get blueprints' });
+  }
+});
+
+
+
+
+// ─── ROOT ──────────────────────────────────────────────────────────────────
 app.get('/', (req: Request, res: Response) => {
   res.send('Hello World!');
 });
