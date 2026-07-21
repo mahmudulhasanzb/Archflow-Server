@@ -204,8 +204,12 @@ app.get('/', (req: Request, res: Response) => {
   res.send('Hello World!');
 });
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(port, () => {
+    console.log(`Example app listening on port ${port}`);
+  });
+}
 
 connectToDatabase();
+
+export default app;
