@@ -1,5 +1,5 @@
 import express, { type Request, type Response } from 'express';
-import { MongoClient, Db } from 'mongodb';
+import { MongoClient, Db, ObjectId } from 'mongodb';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { features } from 'node:process';
@@ -21,32 +21,7 @@ const MONGODB_URI = process.env.MONGODB_URI as string;
 
 // const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
 
-const blueprintsCollection = [
-  {
-    title: 'Blueprint title',
-    description: 'description',
-    teckStack: ['Nextjs', 'React', 'MongoDB'],
-    complexcity: 'medium',
-    architectureFlow: {
-      architecture: {
-       
-            title: 'Architecture step 1',
-            description: 'Architecture step 1 description',
-      },
-      features: {
-            title: 'Features step 1',
-            description: 'Features step 1 description',
-      },
-      plan: {
-            title: 'Plan step 1',
-            description: 'Plan step 1 description',
-          }
-    },
-    status: 'ready',
-    rating: 5,
-    author: 'hasan@gmail.com',
-  },
-];
+
 
 // ── MongoDB connection ─────────────────────────────
 if (!MONGODB_URI) {
@@ -56,27 +31,32 @@ if (!MONGODB_URI) {
 }
 
 const client = new MongoClient(MONGODB_URI);
-let dbConnection: Db;
+let db: Db;
+let userCollection: any;
+let blueprintCollection: any;
 
 export async function connectToDatabase(): Promise<Db> {
-  if (dbConnection) return dbConnection;
+  if (db) return db;
 
   try {
     await client.connect();
     console.log('Successfully connected to MongoDB server.');
-    dbConnection = client.db();
-    return dbConnection;
+    db = client.db("archflow");
+    userCollection = db.collection('user');
+    blueprintCollection = db.collection('blueprints');
+    return db;
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
-    process.exit(1);
   }
 }
 
+
 // routes
 
+// get all blueprints
 app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   try {
-    const blueprints = blueprintsCollection;
+    const blueprints = await blueprintCollection.find().toArray();
     res.status(200).json(blueprints);
   } catch (error) {
     console.error('Failed to get blueprints:', error);
@@ -84,8 +64,39 @@ app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   }
 });
 
+// get blueprint by id
+app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    let query: any = {};
+    if (ObjectId.isValid(id)) {
+      query = { _id: new ObjectId(id) };
+    } else {
+      query = { $or: [{ id: Number(id) || id }, { _id: id }] };
+    }
+    const blueprint = await blueprintCollection.findOne(query);
+    if (!blueprint) {
+      res.status(404).json({ error: 'Blueprint not found' });
+      return;
+    }
+    res.status(200).json(blueprint);
+  } catch (error) {
+    console.error('Failed to get blueprint:', error);
+    res.status(500).json({ error: 'Failed to get blueprint' });
+  }
+});
 
-
+// post blueprint
+app.post('/api/blueprints', async (req: Request, res: Response) => {
+  try {
+    const blueprint = req.body;
+    const result = await blueprintCollection.insertOne(blueprint);
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('Failed to create blueprint:', error);
+    res.status(500).json({ error: 'Failed to create blueprint' });
+  }
+});
 
 // ─── ROOT ──────────────────────────────────────────────────────────────────
 app.get('/', (req: Request, res: Response) => {
