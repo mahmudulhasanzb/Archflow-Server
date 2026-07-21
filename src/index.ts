@@ -12,6 +12,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Database connection middleware for Serverless environment
+app.use(async (req: Request, res: Response, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    console.error('Database connection failed:', error);
+    res.status(500).json({ error: 'Database connection failed' });
+  }
+});
+
 const port = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI as string;
 // const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
@@ -20,8 +31,6 @@ const MONGODB_URI = process.env.MONGODB_URI as string;
 // const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
-
-
 
 // ── MongoDB connection ─────────────────────────────
 if (!MONGODB_URI) {
@@ -41,22 +50,25 @@ export async function connectToDatabase(): Promise<Db> {
   try {
     await client.connect();
     console.log('Successfully connected to MongoDB server.');
-    db = client.db("archflow");
+    db = client.db('archflow');
     userCollection = db.collection('user');
     blueprintCollection = db.collection('blueprints');
     return db;
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
+    throw error;
   }
 }
-
 
 // routes
 
 // get all blueprints
 app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   try {
-    const blueprints = await blueprintCollection.find().sort({ createdAt: -1, _id: -1 }).toArray();
+    const blueprints = await blueprintCollection
+      .find()
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
     res.status(200).json(blueprints);
   } catch (error) {
     console.error('Failed to get blueprints:', error);
@@ -70,22 +82,28 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
     const { creatorId } = req.query;
     let query: any = {};
     if (creatorId && !creatorId.toString().includes('demo')) {
-      query = { 
+      query = {
         $or: [
-          { creatorId }, 
-          { userId: creatorId }, 
+          { creatorId },
+          { userId: creatorId },
           { author: creatorId },
-          { email: creatorId }
-        ] 
+          { email: creatorId },
+        ],
       };
     }
-    let blueprints = await blueprintCollection.find(query).sort({ createdAt: -1, _id: -1 }).toArray();
-    
+    let blueprints = await blueprintCollection
+      .find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
     // Fallback: If no blueprints match the query, return all blueprints
     if (blueprints.length === 0) {
-      blueprints = await blueprintCollection.find().sort({ createdAt: -1, _id: -1 }).toArray();
+      blueprints = await blueprintCollection
+        .find()
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray();
     }
-    
+
     res.status(200).json(blueprints);
   } catch (error) {
     console.error('Failed to query blueprints:', error);
@@ -97,6 +115,10 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
 app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    if (typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
     let query: any = {};
     if (ObjectId.isValid(id)) {
       query = { _id: new ObjectId(id) };
@@ -133,19 +155,22 @@ app.get('/api/my-blueprints/:email', async (req: Request, res: Response) => {
   try {
     const { email } = req.params;
     let query: any = {
-      $or: [
-        { email },
-        { author: email }
-      ]
+      $or: [{ email }, { author: email }],
     };
-    let blueprints = await blueprintCollection.find(query).sort({ createdAt: -1, _id: -1 }).toArray();
-    
+    let blueprints = await blueprintCollection
+      .find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
     // Fallback: If no blueprints are found for this email, or if it is the demo user,
     // return all blueprints so the user can manage existing projects.
     if (blueprints.length === 0 || email === 'demo@archflow.com') {
-      blueprints = await blueprintCollection.find().sort({ createdAt: -1, _id: -1 }).toArray();
+      blueprints = await blueprintCollection
+        .find()
+        .sort({ createdAt: -1, _id: -1 })
+        .toArray();
     }
-    
+
     res.status(200).json(blueprints);
   } catch (error) {
     console.error('Failed to get blueprints:', error);
@@ -157,6 +182,10 @@ app.get('/api/my-blueprints/:email', async (req: Request, res: Response) => {
 app.patch('/api/blueprints/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    if (typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
     const blueprint = req.body;
     let query: any = {};
     if (ObjectId.isValid(id)) {
@@ -164,7 +193,9 @@ app.patch('/api/blueprints/:id', async (req: Request, res: Response) => {
     } else {
       query = { $or: [{ id: Number(id) || id }, { _id: id }] };
     }
-    const result = await blueprintCollection.updateOne(query, { $set: blueprint });
+    const result = await blueprintCollection.updateOne(query, {
+      $set: blueprint,
+    });
     if (result.matchedCount === 0) {
       res.status(404).json({ error: 'Blueprint not found' });
       return;
@@ -180,6 +211,10 @@ app.patch('/api/blueprints/:id', async (req: Request, res: Response) => {
 app.delete('/api/my-blueprints/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    if (typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
     let query: any = {};
     if (ObjectId.isValid(id)) {
       query = { _id: new ObjectId(id) };
@@ -198,13 +233,12 @@ app.delete('/api/my-blueprints/:id', async (req: Request, res: Response) => {
   }
 });
 
-
 // ─── ROOT ──────────────────────────────────────────────────────────────────
 app.get('/', (req: Request, res: Response) => {
   res.send('Hello World!');
 });
 
-if (process.env.NODE_ENV !== 'production') {
+if (!process.env.VERCEL) {
   app.listen(port, () => {
     console.log(`Example app listening on port ${port}`);
   });
