@@ -2,14 +2,53 @@ import express, { type Request, type Response } from 'express';
 import { MongoClient, Db, ObjectId } from 'mongodb';
 import cors from 'cors';
 import dotenv from 'dotenv';
-// import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
+import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
 // import Stripe from 'stripe';
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
+
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
+
+app.use(
+  cors({
+    origin: [CLIENT_URL, 'http://localhost:3000', 'https://archflow-client.vercel.app'].filter(Boolean),
+    credentials: true,
+  })
+);
 app.use(express.json());
+
+// JWKS remote key set setup (fetches public keys from Next.js better-auth JWKS endpoint)
+const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
+
+// JWT Token Verification Middleware
+export const verifyToken = async (req: Request, res: Response, next: any) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Unauthorized: Missing or invalid token format' });
+    return;
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  if (!token) {
+    res.status(401).json({ error: 'Unauthorized: Token missing' });
+    return;
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    (req as any).user = payload;
+    next();
+  } catch (error) {
+    console.error('JWT Verification error:', error);
+    res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
+    return;
+  }
+};
 
 // Database connection middleware for Serverless environment
 app.use(async (req: Request, res: Response, next) => {
@@ -24,12 +63,6 @@ app.use(async (req: Request, res: Response, next) => {
 
 const port = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI as string;
-// const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
-// const STRIPE_SUCCESS_URL = process.env.STRIPE_SUCCESS_URL ||
-//   `${CLIENT_URL}/dashboard/supporter/purcess`;
-// const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
-
-// const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
 
 // ── MongoDB connection ─────────────────────────────
 if (!MONGODB_URI) {
@@ -61,7 +94,7 @@ export async function connectToDatabase(): Promise<Db> {
 
 // routes
 
-// get all blueprints
+// get all blueprints (public)
 app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   try {
     const blueprints = await blueprintCollection
@@ -75,7 +108,7 @@ app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   }
 });
 
-// get blueprints (with optional query filter)
+// get blueprints (with optional query filter) (public)
 app.get('/api/blueprints', async (req: Request, res: Response) => {
   try {
     const { creatorId } = req.query;
@@ -116,7 +149,7 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
       .sort({ createdAt: -1, _id: -1 })
       .toArray();
 
-    // Fallback: Only if no creatorId is provided (unauthenticated / general exploration)
+    // Fallback: Only if no creatorId is provided
     if (!creatorId && blueprints.length === 0) {
       blueprints = await blueprintCollection
         .find()
@@ -131,7 +164,7 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
   }
 });
 
-// get blueprint by id
+// get blueprint by id (public)
 app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -157,10 +190,15 @@ app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   }
 });
 
-// post blueprint
-app.post('/api/blueprints', async (req: Request, res: Response) => {
+// post blueprint (protected with verifyToken)
+app.post('/api/blueprints', verifyToken, async (req: Request, res: Response) => {
   try {
     const blueprint = req.body;
+    const userPayload = (req as any).user;
+    if (userPayload && userPayload.email) {
+      blueprint.author = blueprint.author || userPayload.email;
+      blueprint.creatorId = blueprint.creatorId || userPayload.id || userPayload.sub;
+    }
     const result = await blueprintCollection.insertOne(blueprint);
     res.status(200).json(result);
   } catch (error) {
@@ -169,13 +207,20 @@ app.post('/api/blueprints', async (req: Request, res: Response) => {
   }
 });
 
-// get and manage blueprints of a user by his email
-// get blueprint by email
-app.get('/api/my-blueprints/:email', async (req: Request, res: Response) => {
+// get user blueprints by email (protected with verifyToken)
+app.get('/api/my-blueprints/:email', verifyToken, async (req: Request, res: Response) => {
   try {
-    const { email } = req.params;
+    const emailParam = String(req.params.email || '');
+    const userPayload = (req as any).user;
+
+    // Verify token payload email matches requested email
+    if (userPayload && userPayload.email && userPayload.email.toLowerCase() !== emailParam.toLowerCase()) {
+      res.status(403).json({ error: 'Forbidden: You cannot access other users blueprints' });
+      return;
+    }
+
     let query: any = {
-      author: email,
+      $or: [{ author: emailParam }, { email: emailParam }],
     };
     let blueprints = await blueprintCollection
       .find(query)
@@ -189,8 +234,8 @@ app.get('/api/my-blueprints/:email', async (req: Request, res: Response) => {
   }
 });
 
-// update blueprint
-app.patch('/api/blueprints/:id', async (req: Request, res: Response) => {
+// update blueprint (protected with verifyToken)
+app.patch('/api/blueprints/:id', verifyToken, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     if (typeof id !== 'string') {
@@ -204,6 +249,7 @@ app.patch('/api/blueprints/:id', async (req: Request, res: Response) => {
     } else {
       query = { $or: [{ id: Number(id) || id }, { _id: id }] };
     }
+
     const result = await blueprintCollection.updateOne(query, {
       $set: blueprint,
     });
@@ -218,8 +264,8 @@ app.patch('/api/blueprints/:id', async (req: Request, res: Response) => {
   }
 });
 
-// delete blueprint
-app.delete('/api/my-blueprints/:id', async (req: Request, res: Response) => {
+// delete blueprint (protected with verifyToken)
+app.delete('/api/my-blueprints/:id', verifyToken, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     if (typeof id !== 'string') {
@@ -246,12 +292,12 @@ app.delete('/api/my-blueprints/:id', async (req: Request, res: Response) => {
 
 // ─── ROOT ──────────────────────────────────────────────────────────────────
 app.get('/', (req: Request, res: Response) => {
-  res.send('Hello World!');
+  res.send('Archflow Server is running fine!');
 });
 
 if (!process.env.VERCEL) {
   app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`);
+    console.log(`Archflow server listening on port ${port}`);
   });
 }
 
