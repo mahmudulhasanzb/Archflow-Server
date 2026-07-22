@@ -2,7 +2,6 @@ import express, { type Request, type Response } from 'express';
 import { MongoClient, Db, ObjectId } from 'mongodb';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { features } from 'node:process';
 // import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
 // import Stripe from 'stripe';
 
@@ -81,7 +80,23 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
   try {
     const { creatorId } = req.query;
     let query: any = {};
-    if (creatorId && !creatorId.toString().includes('demo')) {
+    if (creatorId) {
+      let userEmail = '';
+      try {
+        let userQuery: any = {};
+        if (ObjectId.isValid(creatorId.toString())) {
+          userQuery = { _id: new ObjectId(creatorId.toString()) };
+        } else {
+          userQuery = { _id: creatorId.toString() };
+        }
+        const user = await userCollection.findOne(userQuery);
+        if (user && user.email) {
+          userEmail = user.email;
+        }
+      } catch (err) {
+        console.error('Failed to look up user by creatorId:', err);
+      }
+
       query = {
         $or: [
           { creatorId },
@@ -90,14 +105,19 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
           { email: creatorId },
         ],
       };
+
+      if (userEmail) {
+        query.$or.push({ author: userEmail });
+        query.$or.push({ email: userEmail });
+      }
     }
     let blueprints = await blueprintCollection
       .find(query)
       .sort({ createdAt: -1, _id: -1 })
       .toArray();
 
-    // Fallback: If no blueprints match the query, return all blueprints
-    if (blueprints.length === 0) {
+    // Fallback: Only if no creatorId is provided (unauthenticated / general exploration)
+    if (!creatorId && blueprints.length === 0) {
       blueprints = await blueprintCollection
         .find()
         .sort({ createdAt: -1, _id: -1 })
@@ -155,21 +175,12 @@ app.get('/api/my-blueprints/:email', async (req: Request, res: Response) => {
   try {
     const { email } = req.params;
     let query: any = {
-      $or: [{ email }, { author: email }],
+      author: email,
     };
     let blueprints = await blueprintCollection
       .find(query)
       .sort({ createdAt: -1, _id: -1 })
       .toArray();
-
-    // Fallback: If no blueprints are found for this email, or if it is the demo user,
-    // return all blueprints so the user can manage existing projects.
-    if (blueprints.length === 0 || email === 'demo@archflow.com') {
-      blueprints = await blueprintCollection
-        .find()
-        .sort({ createdAt: -1, _id: -1 })
-        .toArray();
-    }
 
     res.status(200).json(blueprints);
   } catch (error) {
