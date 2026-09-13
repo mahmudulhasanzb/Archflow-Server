@@ -94,11 +94,11 @@ export async function connectToDatabase(): Promise<Db> {
 
 // routes
 
-// get all blueprints (public)
+// get all blueprints (public feed - excludes private blueprints)
 app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   try {
     const blueprints = await blueprintCollection
-      .find()
+      .find({ visibility: { $ne: 'private' } })
       .sort({ createdAt: -1, _id: -1 })
       .toArray();
     res.status(200).json(blueprints);
@@ -108,7 +108,7 @@ app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   }
 });
 
-// get blueprints (with optional query filter) (public)
+// get blueprints (with optional query filter) (public feed excludes private unless creator query)
 app.get('/api/blueprints', async (req: Request, res: Response) => {
   try {
     const { creatorId } = req.query;
@@ -143,6 +143,9 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
         query.$or.push({ author: userEmail });
         query.$or.push({ email: userEmail });
       }
+    } else {
+      // General explore feed: only public
+      query = { visibility: { $ne: 'private' } };
     }
     let blueprints = await blueprintCollection
       .find(query)
@@ -152,7 +155,7 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
     // Fallback: Only if no creatorId is provided
     if (!creatorId && blueprints.length === 0) {
       blueprints = await blueprintCollection
-        .find()
+        .find({ visibility: { $ne: 'private' } })
         .sort({ createdAt: -1, _id: -1 })
         .toArray();
     }
@@ -164,7 +167,7 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
   }
 });
 
-// get blueprint by id (public)
+// get blueprint by id
 app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -183,6 +186,34 @@ app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Blueprint not found' });
       return;
     }
+
+    // If private blueprint, verify requester owns it
+    if (blueprint.visibility === 'private') {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(403).json({ error: 'Forbidden: Private blueprint. Sign in required.' });
+        return;
+      }
+      try {
+        const token = authHeader.split(' ')[1];
+        const { payload } = await jwtVerify(token, JWKS);
+        const userEmail = payload?.email ? String(payload.email).toLowerCase() : '';
+        const userId = String(payload?.id || payload?.sub || '');
+        const isOwner =
+          (blueprint.author && String(blueprint.author).toLowerCase() === userEmail) ||
+          (blueprint.email && String(blueprint.email).toLowerCase() === userEmail) ||
+          (blueprint.creatorId && String(blueprint.creatorId) === userId);
+
+        if (!isOwner) {
+          res.status(403).json({ error: 'Forbidden: You do not have permission to view this private blueprint.' });
+          return;
+        }
+      } catch (jwtErr) {
+        res.status(401).json({ error: 'Unauthorized: Invalid token for private blueprint' });
+        return;
+      }
+    }
+
     res.status(200).json(blueprint);
   } catch (error) {
     console.error('Failed to get blueprint:', error);
@@ -190,17 +221,146 @@ app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   }
 });
 
-// post blueprint (protected with verifyToken)
+// get user blueprint quota/subscription & tier status (protected with verifyToken)
+app.get('/api/user/quota/:email', verifyToken, async (req: Request, res: Response) => {
+  try {
+    const emailParam = String(req.params.email || '').toLowerCase();
+    const userPayload = (req as any).user;
+
+    if (userPayload?.email && userPayload.email.toLowerCase() !== emailParam) {
+      res.status(403).json({ error: 'Forbidden: Cannot access other users quota' });
+      return;
+    }
+
+    // Lookup user record to verify role/plan
+    let userFilter: any = { email: emailParam };
+    if (userPayload?.id && ObjectId.isValid(userPayload.id)) {
+      userFilter = { $or: [{ email: emailParam }, { _id: new ObjectId(userPayload.id) }, { _id: userPayload.id }] };
+    }
+    const user = await userCollection.findOne(userFilter);
+
+    const role = String(user?.role || user?.plan || 'free').toLowerCase();
+    const isPro = role === 'pro' || role === 'admin';
+
+    if (isPro) {
+      // Pro: Max 10 per 24 hours
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const count = await blueprintCollection.countDocuments({
+        $or: [
+          { creatorId: userPayload.id || userPayload.sub },
+          { author: emailParam },
+          { email: emailParam },
+        ],
+        createdAt: { $gte: twentyFourHoursAgo },
+      });
+      const max = 10;
+      const remaining = Math.max(0, max - count);
+      res.status(200).json({
+        role: 'pro',
+        plan: 'pro',
+        isPro: true,
+        count,
+        max,
+        remaining,
+        canGenerate: count < max,
+      });
+    } else {
+      // Free: Max 3 lifetime
+      const count = await blueprintCollection.countDocuments({
+        $or: [
+          { creatorId: userPayload.id || userPayload.sub },
+          { author: emailParam },
+          { email: emailParam },
+        ],
+      });
+      const max = 3;
+      const remaining = Math.max(0, max - count);
+      res.status(200).json({
+        role: 'free',
+        plan: 'free',
+        isPro: false,
+        count,
+        max,
+        remaining,
+        canGenerate: count < max,
+      });
+    }
+  } catch (error) {
+    console.error('Failed to get quota:', error);
+    res.status(500).json({ error: 'Failed to fetch user quota' });
+  }
+});
+
+// post blueprint (protected with verifyToken + quota enforcement)
 app.post('/api/blueprints', verifyToken, async (req: Request, res: Response) => {
   try {
     const blueprint = req.body;
     const userPayload = (req as any).user;
-    if (userPayload && userPayload.email) {
-      blueprint.author = blueprint.author || userPayload.email;
-      blueprint.creatorId = blueprint.creatorId || userPayload.id || userPayload.sub;
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+    const userId = userPayload?.id || userPayload?.sub || '';
+
+    if (!userEmail) {
+      res.status(400).json({ error: 'User email required from auth session' });
+      return;
     }
+
+    // Lookup user record to determine role
+    let userFilter: any = { email: userEmail };
+    if (userId && ObjectId.isValid(userId)) {
+      userFilter = { $or: [{ email: userEmail }, { _id: new ObjectId(userId) }, { _id: userId }] };
+    }
+    const user = await userCollection.findOne(userFilter);
+    const role = String(user?.role || user?.plan || 'free').toLowerCase();
+    const isPro = role === 'pro' || role === 'admin';
+
+    // Enforce quotas
+    if (isPro) {
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const dailyCount = await blueprintCollection.countDocuments({
+        $or: [{ creatorId: userId }, { author: userEmail }, { email: userEmail }],
+        createdAt: { $gte: twentyFourHoursAgo },
+      });
+
+      if (dailyCount >= 10) {
+        res.status(429).json({
+          error: 'Daily generation limit reached (10/10 in 24 hours). Please try again tomorrow.',
+          limitReached: true,
+          role: 'pro',
+          count: dailyCount,
+          max: 10,
+        });
+        return;
+      }
+      // Pro can be private or public
+      blueprint.visibility = blueprint.visibility === 'private' ? 'private' : 'public';
+    } else {
+      const lifetimeCount = await blueprintCollection.countDocuments({
+        $or: [{ creatorId: userId }, { author: userEmail }, { email: userEmail }],
+      });
+
+      if (lifetimeCount >= 3) {
+        res.status(403).json({
+          error: 'Free tier generation limit reached (3/3). Upgrade to Developer Pro for unlimited generations.',
+          limitReached: true,
+          role: 'free',
+          count: lifetimeCount,
+          max: 3,
+        });
+        return;
+      }
+      // Free must always be public
+      blueprint.visibility = 'public';
+    }
+
+    // Metadata binding
+    blueprint.author = blueprint.author || userEmail;
+    blueprint.email = userEmail;
+    blueprint.creatorId = userId;
+    blueprint.createdAt = blueprint.createdAt || new Date().toISOString();
+    blueprint.updatedAt = new Date().toISOString();
+
     const result = await blueprintCollection.insertOne(blueprint);
-    res.status(200).json(result);
+    res.status(200).json({ ...result, insertedId: result.insertedId, blueprintId: result.insertedId });
   } catch (error) {
     console.error('Failed to create blueprint:', error);
     res.status(500).json({ error: 'Failed to create blueprint' });
