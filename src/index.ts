@@ -94,14 +94,81 @@ export async function connectToDatabase(): Promise<Db> {
 
 // routes
 
-// get all blueprints (public feed - excludes private blueprints)
+// get all blueprints (public feed with MongoDB query search, filter, and pagination)
 app.get('/api/all-blueprints', async (req: Request, res: Response) => {
   try {
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const limit = Math.max(1, Math.min(50, parseInt(String(req.query.limit || '6'), 10)));
+    const search = String(req.query.search || '').trim();
+    const stack = String(req.query.stack || '').trim();
+    const complexity = String(req.query.complexity || '').trim();
+    const sort = String(req.query.sort || 'newest').trim();
+
+    const andConditions: any[] = [{ visibility: { $ne: 'private' } }];
+
+    if (search) {
+      andConditions.push({
+        $or: [
+          { title: { $regex: search, $options: 'i' } },
+          { description: { $regex: search, $options: 'i' } },
+          { prompt: { $regex: search, $options: 'i' } },
+        ],
+      });
+    }
+
+    if (stack && stack.toLowerCase() !== 'all') {
+      andConditions.push({
+        $or: [
+          { teckStack: { $regex: stack, $options: 'i' } },
+          { stack: { $regex: stack, $options: 'i' } },
+        ],
+      });
+    }
+
+    if (complexity && complexity.toLowerCase() !== 'all') {
+      andConditions.push({
+        $or: [
+          { complexcity: { $regex: `^${complexity}$`, $options: 'i' } },
+          { complexity: { $regex: `^${complexity}$`, $options: 'i' } },
+        ],
+      });
+    }
+
+    const query = andConditions.length > 1 ? { $and: andConditions } : andConditions[0];
+
+    let sortObj: any = { createdAt: -1, _id: -1 };
+    if (sort === 'oldest') {
+      sortObj = { createdAt: 1, _id: 1 };
+    } else if (sort === 'rating') {
+      sortObj = { rating: -1, createdAt: -1 };
+    }
+    const skip = (page - 1) * limit;
     const blueprints = await blueprintCollection
-      .find({ visibility: { $ne: 'private' } })
-      .sort({ createdAt: -1, _id: -1 })
+      .find(query)
+      .sort(sortObj)
+      .skip(skip)
+      .limit(limit)
       .toArray();
-    res.status(200).json(blueprints);
+
+    const totalData = await blueprintCollection.countDocuments(query);
+    const totalPage = Math.ceil(totalData / limit) || 1;
+
+    // If client requested flat array (legacy caller with no page query)
+    if (!req.query.page && !req.query.limit && !req.query.search) {
+      res.status(200).json(blueprints);
+      return;
+    }
+
+    res.status(200).json({
+      data: blueprints,
+      blueprints,
+      totalData,
+      total: totalData,
+      page,
+      limit,
+      totalPage,
+      totalPages: totalPage,
+    });
   } catch (error) {
     console.error('Failed to get blueprints:', error);
     res.status(500).json({ error: 'Failed to get blueprints' });
@@ -167,7 +234,7 @@ app.get('/api/blueprints', async (req: Request, res: Response) => {
   }
 });
 
-// get blueprint by id
+// get blueprint by id (owner can view their own private blueprint)
 app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -189,27 +256,36 @@ app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
 
     // If private blueprint, verify requester owns it
     if (blueprint.visibility === 'private') {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        res.status(403).json({ error: 'Forbidden: Private blueprint. Sign in required.' });
-        return;
-      }
-      try {
-        const token = authHeader.split(' ')[1];
-        const { payload } = await jwtVerify(token, JWKS);
-        const userEmail = payload?.email ? String(payload.email).toLowerCase() : '';
-        const userId = String(payload?.id || payload?.sub || '');
-        const isOwner =
-          (blueprint.author && String(blueprint.author).toLowerCase() === userEmail) ||
-          (blueprint.email && String(blueprint.email).toLowerCase() === userEmail) ||
-          (blueprint.creatorId && String(blueprint.creatorId) === userId);
+      let requesterEmail = '';
+      let requesterId = '';
 
-        if (!isOwner) {
-          res.status(403).json({ error: 'Forbidden: You do not have permission to view this private blueprint.' });
-          return;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const token = authHeader.split(' ')[1];
+          const { payload } = await jwtVerify(token, JWKS);
+          requesterEmail = payload?.email ? String(payload.email).toLowerCase() : '';
+          requesterId = String(payload?.id || payload?.sub || '');
+        } catch (jwtErr) {
+          // Token expired or server component internal token
         }
-      } catch (jwtErr) {
-        res.status(401).json({ error: 'Unauthorized: Invalid token for private blueprint' });
+      }
+
+      // Check forwarded server-component headers
+      if (!requesterEmail && req.headers['x-user-email']) {
+        requesterEmail = String(req.headers['x-user-email']).toLowerCase();
+      }
+      if (!requesterId && req.headers['x-user-id']) {
+        requesterId = String(req.headers['x-user-id']);
+      }
+
+      const isOwner =
+        (blueprint.author && String(blueprint.author).toLowerCase() === requesterEmail) ||
+        (blueprint.email && String(blueprint.email).toLowerCase() === requesterEmail) ||
+        (blueprint.creatorId && String(blueprint.creatorId) === requesterId);
+
+      if (!isOwner) {
+        res.status(403).json({ error: 'Forbidden: You do not have permission to view this private blueprint.' });
         return;
       }
     }
@@ -218,6 +294,54 @@ app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Failed to get blueprint:', error);
     res.status(500).json({ error: 'Failed to get blueprint' });
+  }
+});
+
+// dynamic rating endpoint (users rate 1-5 stars)
+app.post('/api/blueprints/:id/rate', async (req: Request, res: Response) => {
+  try {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!id || typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
+    const { rating } = req.body;
+    const numRating = Number(rating);
+
+    if (!numRating || numRating < 1 || numRating > 5) {
+      res.status(400).json({ error: 'Rating must be between 1 and 5' });
+      return;
+    }
+
+    let query: any = {};
+    if (ObjectId.isValid(id)) {
+      query = { _id: new ObjectId(id) };
+    } else {
+      query = { $or: [{ id: Number(id) || id }, { _id: id }] };
+    }
+
+    const bp = await blueprintCollection.findOne(query);
+    if (!bp) {
+      res.status(404).json({ error: 'Blueprint not found' });
+      return;
+    }
+
+    const currentRatings: number[] = Array.isArray(bp.ratings) ? bp.ratings : [];
+    currentRatings.push(numRating);
+    const avg = Number((currentRatings.reduce((a, b) => a + b, 0) / currentRatings.length).toFixed(1));
+
+    await blueprintCollection.updateOne(query, {
+      $set: {
+        ratings: currentRatings,
+        rating: avg,
+        ratingsCount: currentRatings.length,
+      },
+    });
+
+    res.status(200).json({ success: true, rating: avg, ratingsCount: currentRatings.length });
+  } catch (error) {
+    console.error('Failed to rate blueprint:', error);
+    res.status(500).json({ error: 'Failed to rate blueprint' });
   }
 });
 
@@ -367,11 +491,12 @@ app.post('/api/blueprints', verifyToken, async (req: Request, res: Response) => 
   }
 });
 
-// get user blueprints by email (protected with verifyToken)
+// get user blueprints by email (protected with verifyToken + MongoDB search)
 app.get('/api/my-blueprints/:email', verifyToken, async (req: Request, res: Response) => {
   try {
-    const emailParam = String(req.params.email || '');
+    const emailParam = String(req.params.email || '').toLowerCase();
     const userPayload = (req as any).user;
+    const search = String(req.query.search || '').trim();
 
     // Verify token payload email matches requested email
     if (userPayload && userPayload.email && userPayload.email.toLowerCase() !== emailParam.toLowerCase()) {
@@ -379,9 +504,54 @@ app.get('/api/my-blueprints/:email', verifyToken, async (req: Request, res: Resp
       return;
     }
 
-    let query: any = {
-      $or: [{ author: emailParam }, { email: emailParam }],
+    const ownershipCondition: any = {
+      $or: [
+        { author: emailParam },
+        { email: emailParam },
+        ...(userPayload?.id ? [{ creatorId: userPayload.id }, { userId: userPayload.id }] : []),
+      ],
     };
+
+    let query: any = ownershipCondition;
+    if (search) {
+      query = {
+        $and: [
+          ownershipCondition,
+          {
+            $or: [
+              { title: { $regex: search, $options: 'i' } },
+              { description: { $regex: search, $options: 'i' } },
+              { prompt: { $regex: search, $options: 'i' } },
+            ],
+          },
+        ],
+      };
+    }
+
+    const { page, limit } = req.query;
+    if (page && limit) {
+      const skip = (Number(page) - 1) * Number(limit);
+      const blueprints = await blueprintCollection
+        .find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(skip)
+        .limit(Number(limit))
+        .toArray();
+      const totalData = await blueprintCollection.countDocuments(query);
+      const totalPage = Math.ceil(totalData / Number(limit)) || 1;
+      res.status(200).json({
+        data: blueprints,
+        blueprints,
+        totalData,
+        total: totalData,
+        totalPage,
+        totalPages: totalPage,
+        page: Number(page),
+        limit: Number(limit),
+      });
+      return;
+    }
+
     let blueprints = await blueprintCollection
       .find(query)
       .sort({ createdAt: -1, _id: -1 })
@@ -394,7 +564,7 @@ app.get('/api/my-blueprints/:email', verifyToken, async (req: Request, res: Resp
   }
 });
 
-// update blueprint (protected with verifyToken)
+// update blueprint (protected with verifyToken + safe immutable field exclusion)
 app.patch('/api/blueprints/:id', verifyToken, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -402,7 +572,16 @@ app.patch('/api/blueprints/:id', verifyToken, async (req: Request, res: Response
       res.status(400).json({ error: 'Invalid ID' });
       return;
     }
-    const blueprint = req.body;
+    const updatePayload = { ...req.body };
+
+    // Strip immutable fields
+    delete updatePayload._id;
+    delete updatePayload.creatorId;
+    delete updatePayload.author;
+    delete updatePayload.email;
+    delete updatePayload.createdAt;
+    updatePayload.updatedAt = new Date().toISOString();
+
     let query: any = {};
     if (ObjectId.isValid(id)) {
       query = { _id: new ObjectId(id) };
@@ -411,13 +590,13 @@ app.patch('/api/blueprints/:id', verifyToken, async (req: Request, res: Response
     }
 
     const result = await blueprintCollection.updateOne(query, {
-      $set: blueprint,
+      $set: updatePayload,
     });
     if (result.matchedCount === 0) {
       res.status(404).json({ error: 'Blueprint not found' });
       return;
     }
-    res.status(200).json(result);
+    res.status(200).json({ success: true, modifiedCount: result.modifiedCount });
   } catch (error) {
     console.error('Failed to update blueprint:', error);
     res.status(500).json({ error: 'Failed to update blueprint' });
