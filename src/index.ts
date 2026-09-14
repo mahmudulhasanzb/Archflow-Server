@@ -572,6 +572,24 @@ app.patch('/api/blueprints/:id', verifyToken, async (req: Request, res: Response
       res.status(400).json({ error: 'Invalid ID' });
       return;
     }
+
+    const userPayload = (req as any).user;
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+
+    // Verify user is Pro
+    const userDoc = await userCollection.findOne({ email: userEmail });
+    const isPro =
+      userDoc?.role === 'pro' ||
+      userDoc?.role === 'admin' ||
+      userDoc?.plan === 'pro' ||
+      userPayload?.role === 'pro' ||
+      userPayload?.role === 'admin';
+
+    if (!isPro) {
+      res.status(403).json({ error: 'Forbidden: Blueprint editing is exclusive to Pro members.' });
+      return;
+    }
+
     const updatePayload = { ...req.body };
 
     // Strip immutable fields
@@ -580,6 +598,10 @@ app.patch('/api/blueprints/:id', verifyToken, async (req: Request, res: Response
     delete updatePayload.author;
     delete updatePayload.email;
     delete updatePayload.createdAt;
+    delete updatePayload.rating;
+    delete updatePayload.totalRatings;
+    delete updatePayload.averageRating;
+    delete updatePayload.reviews;
     updatePayload.updatedAt = new Date().toISOString();
 
     let query: any = {};
