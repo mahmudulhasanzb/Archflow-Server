@@ -83,6 +83,7 @@ let db: Db;
 let userCollection: any;
 let blueprintCollection: any;
 let bookmarkCollection: any;
+let ratingCollection: any;
 
 export async function connectToDatabase(): Promise<Db> {
   if (db) return db;
@@ -95,6 +96,8 @@ export async function connectToDatabase(): Promise<Db> {
     blueprintCollection = db.collection('blueprints');
     bookmarkCollection = db.collection('bookmarks');
     bookmarkCollection.createIndex({ userId: 1, blueprintId: 1 }).catch(() => {});
+    ratingCollection = db.collection('ratings');
+    ratingCollection.createIndex({ userId: 1, blueprintId: 1 }).catch(() => {});
     return db;
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
@@ -311,8 +314,8 @@ app.get('/api/blueprints/:id', async (req: Request, res: Response) => {
   }
 });
 
-// dynamic rating endpoint (users rate 1-5 stars)
-app.post('/api/blueprints/:id/rate', async (req: Request, res: Response) => {
+// dynamic rating endpoint (each user can only rate each blueprint once)
+app.post('/api/blueprints/:id/rate', verifyToken, async (req: Request, res: Response) => {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     if (!id || typeof id !== 'string') {
@@ -324,6 +327,15 @@ app.post('/api/blueprints/:id/rate', async (req: Request, res: Response) => {
 
     if (!numRating || numRating < 1 || numRating > 5) {
       res.status(400).json({ error: 'Rating must be between 1 and 5' });
+      return;
+    }
+
+    const userPayload = (req as any).user;
+    const userId = String(userPayload?.id || userPayload?.sub || '');
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+
+    if (!userId && !userEmail) {
+      res.status(401).json({ error: 'Unauthorized: User identity missing' });
       return;
     }
 
@@ -340,6 +352,29 @@ app.post('/api/blueprints/:id/rate', async (req: Request, res: Response) => {
       return;
     }
 
+    // Check if this user has already rated this blueprint
+    const existingRating = await ratingCollection.findOne({
+      blueprintId: id,
+      $or: [
+        ...(userId ? [{ userId }] : []),
+        ...(userEmail ? [{ userEmail }] : []),
+      ],
+    });
+
+    if (existingRating) {
+      res.status(400).json({ error: 'You have already rated this blueprint' });
+      return;
+    }
+
+    // Record user rating in database
+    await ratingCollection.insertOne({
+      blueprintId: id,
+      userId: userId || userEmail,
+      userEmail,
+      rating: numRating,
+      createdAt: new Date().toISOString(),
+    });
+
     const currentRatings: number[] = Array.isArray(bp.ratings) ? bp.ratings : [];
     currentRatings.push(numRating);
     const avg = Number((currentRatings.reduce((a, b) => a + b, 0) / currentRatings.length).toFixed(1));
@@ -352,10 +387,54 @@ app.post('/api/blueprints/:id/rate', async (req: Request, res: Response) => {
       },
     });
 
-    res.status(200).json({ success: true, rating: avg, ratingsCount: currentRatings.length });
+    res.status(200).json({
+      success: true,
+      rating: avg,
+      ratingsCount: currentRatings.length,
+      hasRated: true,
+      userRating: numRating,
+      message: 'Rating submitted successfully',
+    });
   } catch (error) {
     console.error('Failed to rate blueprint:', error);
     res.status(500).json({ error: 'Failed to rate blueprint' });
+  }
+});
+
+// get current user's rating status for a blueprint
+app.get('/api/blueprints/:id/user-rating', verifyToken, async (req: Request, res: Response) => {
+  try {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!id || typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
+
+    const userPayload = (req as any).user;
+    const userId = String(userPayload?.id || userPayload?.sub || '');
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+
+    if (!userId && !userEmail) {
+      res.status(200).json({ hasRated: false, userRating: null });
+      return;
+    }
+
+    const ratingDoc = await ratingCollection.findOne({
+      blueprintId: id,
+      $or: [
+        ...(userId ? [{ userId }] : []),
+        ...(userEmail ? [{ userEmail }] : []),
+      ],
+    });
+
+    if (ratingDoc) {
+      res.status(200).json({ hasRated: true, userRating: ratingDoc.rating });
+    } else {
+      res.status(200).json({ hasRated: false, userRating: null });
+    }
+  } catch (error) {
+    console.error('Failed to get user rating:', error);
+    res.status(500).json({ error: 'Failed to get user rating' });
   }
 });
 
