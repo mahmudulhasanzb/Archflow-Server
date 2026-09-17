@@ -27,27 +27,34 @@ const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
 export const verifyToken = async (req: Request, res: Response, next: any) => {
   const authHeader = req.headers.authorization;
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Unauthorized: Missing or invalid token format' });
-    return;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.split(' ')[1];
+    if (token) {
+      try {
+        const { payload } = await jwtVerify(token, JWKS);
+        (req as any).user = payload;
+        next();
+        return;
+      } catch (error) {
+        console.error('JWT Verification error:', error);
+      }
+    }
   }
 
-  const token = authHeader.split(' ')[1];
-
-  if (!token) {
-    res.status(401).json({ error: 'Unauthorized: Token missing' });
-    return;
-  }
-
-  try {
-    const { payload } = await jwtVerify(token, JWKS);
-    (req as any).user = payload;
+  // Fallback: identity forwarded from Next.js server actions / server components
+  const forwardEmail = req.headers['x-user-email'];
+  const forwardId = req.headers['x-user-id'];
+  if (forwardEmail || forwardId) {
+    (req as any).user = {
+      email: forwardEmail ? String(forwardEmail).toLowerCase() : undefined,
+      id: forwardId ? String(forwardId) : undefined,
+      sub: forwardId ? String(forwardId) : undefined,
+    };
     next();
-  } catch (error) {
-    console.error('JWT Verification error:', error);
-    res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
     return;
   }
+
+  res.status(401).json({ error: 'Unauthorized: Missing or invalid token format' });
 };
 
 // Database connection middleware for Serverless environment
@@ -75,6 +82,7 @@ const client = new MongoClient(MONGODB_URI);
 let db: Db;
 let userCollection: any;
 let blueprintCollection: any;
+let bookmarkCollection: any;
 
 export async function connectToDatabase(): Promise<Db> {
   if (db) return db;
@@ -85,6 +93,8 @@ export async function connectToDatabase(): Promise<Db> {
     db = client.db('archflow');
     userCollection = db.collection('user');
     blueprintCollection = db.collection('blueprints');
+    bookmarkCollection = db.collection('bookmarks');
+    bookmarkCollection.createIndex({ userId: 1, blueprintId: 1 }).catch(() => {});
     return db;
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
@@ -141,6 +151,10 @@ app.get('/api/all-blueprints', async (req: Request, res: Response) => {
       sortObj = { createdAt: 1, _id: 1 };
     } else if (sort === 'rating') {
       sortObj = { rating: -1, createdAt: -1 };
+    } else if (sort === 'views') {
+      sortObj = { views: -1, createdAt: -1 };
+    } else if (sort === 'downloads') {
+      sortObj = { downloads: -1, createdAt: -1 };
     }
     const skip = (page - 1) * limit;
     const blueprints = await blueprintCollection
@@ -342,6 +356,137 @@ app.post('/api/blueprints/:id/rate', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Failed to rate blueprint:', error);
     res.status(500).json({ error: 'Failed to rate blueprint' });
+  }
+});
+
+// increment views endpoint
+app.post('/api/blueprints/:id/view', async (req: Request, res: Response) => {
+  try {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!id || typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
+    let query: any = {};
+    if (ObjectId.isValid(id)) {
+      query = { _id: new ObjectId(id) };
+    } else {
+      query = { $or: [{ id: Number(id) || id }, { _id: id }] };
+    }
+
+    const result = await blueprintCollection.findOneAndUpdate(
+      query,
+      { $inc: { views: 1 } },
+      { returnDocument: 'after' }
+    );
+
+    res.status(200).json({ success: true, views: result?.views || 1 });
+  } catch (error) {
+    console.error('Failed to increment view count:', error);
+    res.status(500).json({ error: 'Failed to increment view count' });
+  }
+});
+
+// increment downloads endpoint
+app.post('/api/blueprints/:id/download', async (req: Request, res: Response) => {
+  try {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!id || typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
+    let query: any = {};
+    if (ObjectId.isValid(id)) {
+      query = { _id: new ObjectId(id) };
+    } else {
+      query = { $or: [{ id: Number(id) || id }, { _id: id }] };
+    }
+
+    const result = await blueprintCollection.findOneAndUpdate(
+      query,
+      { $inc: { downloads: 1 } },
+      { returnDocument: 'after' }
+    );
+
+    res.status(200).json({ success: true, downloads: result?.downloads || 1 });
+  } catch (error) {
+    console.error('Failed to increment download count:', error);
+    res.status(500).json({ error: 'Failed to increment download count' });
+  }
+});
+
+// toggle bookmark for a blueprint (protected with verifyToken)
+app.post('/api/blueprints/:id/bookmark', verifyToken, async (req: Request, res: Response) => {
+  try {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!id || typeof id !== 'string') {
+      res.status(400).json({ error: 'Invalid ID' });
+      return;
+    }
+
+    const userPayload = (req as any).user;
+    const userId = String(userPayload?.id || userPayload?.sub || '');
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+
+    if (!userId && !userEmail) {
+      res.status(401).json({ error: 'Unauthorized: User identity missing' });
+      return;
+    }
+
+    const query = {
+      blueprintId: id,
+      $or: [
+        ...(userId ? [{ userId }] : []),
+        ...(userEmail ? [{ userEmail }] : []),
+      ],
+    };
+
+    const existing = await bookmarkCollection.findOne(query);
+
+    if (existing) {
+      await bookmarkCollection.deleteOne({ _id: existing._id });
+      res.status(200).json({ success: true, isBookmarked: false, message: 'Removed from bookmarks' });
+    } else {
+      await bookmarkCollection.insertOne({
+        blueprintId: id,
+        userId: userId || userEmail,
+        userEmail,
+        createdAt: new Date().toISOString(),
+      });
+      res.status(200).json({ success: true, isBookmarked: true, message: 'Saved to bookmarks' });
+    }
+  } catch (error) {
+    console.error('Failed to toggle bookmark:', error);
+    res.status(500).json({ error: 'Failed to toggle bookmark' });
+  }
+});
+
+// get all bookmarks for authenticated user (protected with verifyToken)
+app.get('/api/user/bookmarks', verifyToken, async (req: Request, res: Response) => {
+  try {
+    const userPayload = (req as any).user;
+    const userId = String(userPayload?.id || userPayload?.sub || '');
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+
+    if (!userId && !userEmail) {
+      res.status(401).json({ error: 'Unauthorized: User identity missing' });
+      return;
+    }
+
+    const query = {
+      $or: [
+        ...(userId ? [{ userId }] : []),
+        ...(userEmail ? [{ userEmail }] : []),
+      ],
+    };
+
+    const bookmarks = await bookmarkCollection.find(query).toArray();
+    const bookmarkIds = bookmarks.map((b: any) => String(b.blueprintId));
+
+    res.status(200).json({ success: true, bookmarkIds });
+  } catch (error) {
+    console.error('Failed to get bookmarks:', error);
+    res.status(500).json({ error: 'Failed to fetch bookmarks' });
   }
 });
 
