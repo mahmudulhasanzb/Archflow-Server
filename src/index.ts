@@ -1116,19 +1116,19 @@ app.patch('/api/admin/users/:id/block', verifyToken, verifyAdmin, async (req: Re
   }
 });
 
-// User role toggle (Free ↔ Pro)
+// User role toggle (Free ↔ Pro or User ↔ Admin)
 app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
   try {
     const rawId = req.params.id;
     const id = Array.isArray(rawId) ? rawId[0] : String(rawId || '');
     const { role } = req.body;
 
-    if (!['free', 'pro'].includes(String(role).toLowerCase())) {
-      res.status(400).json({ error: 'Role must be either free or pro' });
+    const targetRole = String(role || '').toLowerCase();
+    if (!['admin', 'user', 'free', 'pro'].includes(targetRole)) {
+      res.status(400).json({ error: 'Role must be admin, user, free, or pro' });
       return;
     }
 
-    const targetRole = String(role).toLowerCase();
     const filter: any = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { $or: [{ _id: id }, { id }] };
     const targetUser = await userCollection.findOne(filter);
     if (!targetUser) {
@@ -1136,26 +1136,39 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req: Req
       return;
     }
 
-    // Protect administrator accounts from role mutation
-    if (targetUser.role === 'admin') {
-      res.status(400).json({ error: 'Cannot alter role of administrator account' });
+    // Protect administrator from demoting themselves
+    const caller = (req as any).adminUser;
+    const isCallerSelf = caller && (
+      String(caller._id) === String(targetUser._id) ||
+      String(caller.email || '').toLowerCase() === String(targetUser.email || '').toLowerCase()
+    );
+    if (isCallerSelf && targetRole !== 'admin') {
+      res.status(400).json({ error: 'You cannot remove your own administrator privileges' });
       return;
     }
 
+    const updateFields: any = {
+      role: targetRole,
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (['free', 'pro'].includes(targetRole)) {
+      updateFields.plan = targetRole;
+    }
+
     await userCollection.updateOne(filter, {
-      $set: {
-        role: targetRole,
-        plan: targetRole,
-        updatedAt: new Date().toISOString(),
-      },
+      $set: updateFields,
     });
 
     res.status(200).json({
       success: true,
       userId: id,
       role: targetRole,
-      plan: targetRole,
-      message: `User plan updated to ${targetRole.toUpperCase()}`,
+      message: targetRole === 'admin'
+        ? 'User has been promoted to Administrator'
+        : targetRole === 'user'
+          ? 'Administrator privileges have been revoked'
+          : `User plan updated to ${targetRole.toUpperCase()}`,
     });
   } catch (error) {
     console.error('Failed to update user role:', error);
@@ -1163,17 +1176,63 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req: Req
   }
 });
 
-// Get all transaction history with pagination
+// Get all transaction history with search, filters, and pagination
 app.get('/api/admin/transactions', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
   try {
     const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
     const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '10'), 10)));
+    const search = String(req.query.search || '').trim();
+    const plan = String(req.query.plan || '').trim().toLowerCase();
+    const timeframe = String(req.query.timeframe || '').trim().toLowerCase();
 
-    const total = await transactionCollection.countDocuments();
+    const andConditions: any[] = [];
+
+    if (search) {
+      andConditions.push({
+        $or: [
+          { userEmail: { $regex: search, $options: 'i' } },
+          { transactionId: { $regex: search, $options: 'i' } },
+          { planName: { $regex: search, $options: 'i' } },
+        ],
+      });
+    }
+
+    if (plan && plan !== 'all') {
+      andConditions.push({
+        $or: [
+          { planName: { $regex: plan, $options: 'i' } },
+          { plan: { $regex: plan, $options: 'i' } },
+        ],
+      });
+    }
+
+    if (timeframe && timeframe !== 'all') {
+      let sinceDate: Date | null = null;
+      if (timeframe === 'today' || timeframe === '24h') {
+        sinceDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      } else if (timeframe === '7d') {
+        sinceDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      } else if (timeframe === '30d') {
+        sinceDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      }
+
+      if (sinceDate) {
+        andConditions.push({
+          $or: [
+            { createdAt: { $gte: sinceDate } },
+            { createdAt: { $gte: sinceDate.toISOString() } },
+          ],
+        });
+      }
+    }
+
+    const query = andConditions.length > 0 ? { $and: andConditions } : {};
+
+    const total = await transactionCollection.countDocuments(query);
     const totalPages = Math.ceil(total / limit) || 1;
 
     const transactions = await transactionCollection
-      .find()
+      .find(query)
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
