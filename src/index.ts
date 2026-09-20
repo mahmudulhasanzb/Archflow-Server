@@ -57,6 +57,38 @@ export const verifyToken = async (req: Request, res: Response, next: any) => {
   res.status(401).json({ error: 'Unauthorized: Missing or invalid token format' });
 };
 
+// Admin Authorization Middleware (verifies caller has admin role in userCollection)
+export const verifyAdmin = async (req: Request, res: Response, next: any) => {
+  try {
+    const userPayload = (req as any).user;
+    const userId = String(userPayload?.id || userPayload?.sub || '');
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+
+    if (!userId && !userEmail) {
+      res.status(401).json({ error: 'Unauthorized: User identity missing' });
+      return;
+    }
+
+    let userFilter: any = { email: userEmail };
+    if (userId && ObjectId.isValid(userId)) {
+      userFilter = { $or: [{ email: userEmail }, { _id: new ObjectId(userId) }, { _id: userId }] };
+    }
+    const user = await userCollection.findOne(userFilter);
+    const role = String(user?.role || '').toLowerCase();
+
+    if (role !== 'admin') {
+      res.status(403).json({ error: 'Forbidden: Administrator privileges required' });
+      return;
+    }
+
+    (req as any).adminUser = user;
+    next();
+  } catch (err) {
+    console.error('Admin verification error:', err);
+    res.status(500).json({ error: 'Internal server error verifying admin' });
+  }
+};
+
 // Database connection middleware for Serverless environment
 app.use(async (req: Request, res: Response, next) => {
   try {
@@ -84,6 +116,7 @@ let userCollection: any;
 let blueprintCollection: any;
 let bookmarkCollection: any;
 let ratingCollection: any;
+let transactionCollection: any;
 
 export async function connectToDatabase(): Promise<Db> {
   if (db) return db;
@@ -98,6 +131,8 @@ export async function connectToDatabase(): Promise<Db> {
     bookmarkCollection.createIndex({ userId: 1, blueprintId: 1 }).catch(() => {});
     ratingCollection = db.collection('ratings');
     ratingCollection.createIndex({ userId: 1, blueprintId: 1 }).catch(() => {});
+    transactionCollection = db.collection('transactions');
+    transactionCollection.createIndex({ createdAt: -1 }).catch(() => {});
     return db;
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
@@ -587,8 +622,44 @@ app.get('/api/user/quota/:email', verifyToken, async (req: Request, res: Respons
     }
     const user = await userCollection.findOne(userFilter);
 
+    // Admins have unlimited privileges without any plan limitations
     const role = String(user?.role || user?.plan || 'free').toLowerCase();
-    const isPro = role === 'pro' || role === 'admin';
+    const isAdmin = role === 'admin';
+
+    // Soft-block check: restricted from generating blueprints (admins cannot be blocked)
+    if (user?.isGenerationBlocked && !isAdmin) {
+      res.status(200).json({
+        role: 'restricted',
+        plan: 'restricted',
+        isPro: false,
+        isAdmin: false,
+        isBlocked: true,
+        canGenerate: false,
+        count: 0,
+        max: 0,
+        remaining: 0,
+        message: 'Your blueprint generation access has been restricted by an administrator.',
+      });
+      return;
+    }
+
+    if (isAdmin) {
+      res.status(200).json({
+        role: 'admin',
+        plan: 'admin',
+        isPro: true,
+        isAdmin: true,
+        isBlocked: false,
+        count: 0,
+        max: 999999,
+        remaining: 999999,
+        canGenerate: true,
+        unlimited: true,
+      });
+      return;
+    }
+
+    const isPro = role === 'pro';
 
     if (isPro) {
       // Pro: Max 10 per 24 hours
@@ -658,44 +729,62 @@ app.post('/api/blueprints', verifyToken, async (req: Request, res: Response) => 
       userFilter = { $or: [{ email: userEmail }, { _id: new ObjectId(userId) }, { _id: userId }] };
     }
     const user = await userCollection.findOne(userFilter);
+
     const role = String(user?.role || user?.plan || 'free').toLowerCase();
-    const isPro = role === 'pro' || role === 'admin';
+    const isAdmin = role === 'admin';
+
+    // Soft-block check: restricted from generating blueprints (admins cannot be blocked)
+    if (user?.isGenerationBlocked && !isAdmin) {
+      res.status(403).json({
+        error: 'Your blueprint generation access has been restricted by an administrator. Please contact support.',
+        isBlocked: true,
+      });
+      return;
+    }
+
+    const isPro = role === 'pro' || isAdmin;
 
     // Enforce quotas
-    if (isPro) {
-      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const dailyCount = await blueprintCollection.countDocuments({
-        $or: [{ creatorId: userId }, { author: userEmail }, { email: userEmail }],
-        createdAt: { $gte: twentyFourHoursAgo },
-      });
-
-      if (dailyCount >= 10) {
-        res.status(429).json({
-          error: 'Daily generation limit reached (10/10 in 24 hours). Please try again tomorrow.',
-          limitReached: true,
-          role: 'pro',
-          count: dailyCount,
-          max: 10,
+    if (!isAdmin) {
+      if (role === 'pro') {
+        const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const dailyCount = await blueprintCollection.countDocuments({
+          $or: [{ creatorId: userId }, { author: userEmail }, { email: userEmail }],
+          createdAt: { $gte: twentyFourHoursAgo },
         });
-        return;
+
+        if (dailyCount >= 10) {
+          res.status(429).json({
+            error: 'Daily generation limit reached (10/10 in 24 hours). Please try again tomorrow.',
+            limitReached: true,
+            role: 'pro',
+            count: dailyCount,
+            max: 10,
+          });
+          return;
+        }
+      } else {
+        const lifetimeCount = await blueprintCollection.countDocuments({
+          $or: [{ creatorId: userId }, { author: userEmail }, { email: userEmail }],
+        });
+
+        if (lifetimeCount >= 3) {
+          res.status(403).json({
+            error: 'Free tier generation limit reached (3/3). Upgrade to Pro for unlimited generations.',
+            limitReached: true,
+            role: 'free',
+            count: lifetimeCount,
+            max: 3,
+          });
+          return;
+        }
       }
+    }
+
+    if (isPro) {
       // Pro can be private or public
       blueprint.visibility = blueprint.visibility === 'private' ? 'private' : 'public';
     } else {
-      const lifetimeCount = await blueprintCollection.countDocuments({
-        $or: [{ creatorId: userId }, { author: userEmail }, { email: userEmail }],
-      });
-
-      if (lifetimeCount >= 3) {
-        res.status(403).json({
-          error: 'Free tier generation limit reached (3/3). Upgrade to Developer Pro for unlimited generations.',
-          limitReached: true,
-          role: 'free',
-          count: lifetimeCount,
-          max: 3,
-        });
-        return;
-      }
       // Free must always be public
       blueprint.visibility = 'public';
     }
@@ -869,6 +958,388 @@ app.delete('/api/my-blueprints/:id', verifyToken, async (req: Request, res: Resp
       return;
     }
     res.status(200).json(result);
+  } catch (error) {
+    console.error('Failed to delete blueprint:', error);
+    res.status(500).json({ error: 'Failed to delete blueprint' });
+  }
+});
+
+// ─── ADMIN ENDPOINTS ───────────────────────────────────────────────────────
+
+// Get all users with MongoDB search, filter, and pagination
+app.get('/api/admin/users', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
+  try {
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '10'), 10)));
+    const search = String(req.query.search || '').trim();
+    const role = String(req.query.role || '').trim().toLowerCase();
+    const status = String(req.query.status || '').trim().toLowerCase();
+
+    const andConditions: any[] = [];
+
+    if (search) {
+      andConditions.push({
+        $or: [
+          { name: { $regex: search, $options: 'i' } },
+          { email: { $regex: search, $options: 'i' } },
+        ],
+      });
+    }
+
+    if (role && role !== 'all') {
+      andConditions.push({
+        $or: [{ role }, { plan: role }],
+      });
+    }
+
+    if (status && status !== 'all') {
+      if (status === 'blocked') {
+        andConditions.push({ isGenerationBlocked: true });
+      } else if (status === 'active') {
+        andConditions.push({ isGenerationBlocked: { $ne: true } });
+      }
+    }
+
+    const query = andConditions.length > 0 ? (andConditions.length > 1 ? { $and: andConditions } : andConditions[0]) : {};
+
+    const total = await userCollection.countDocuments(query);
+    const totalPages = Math.ceil(total / limit) || 1;
+
+    const users = await userCollection
+      .find(query, { projection: { password: 0 } })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray();
+
+    // Map blueprint counts per author / email
+    const userEmails = users.map((u: any) => String(u.email || '').toLowerCase()).filter(Boolean);
+    const blueprintCounts = await blueprintCollection
+      .aggregate([
+        { $match: { author: { $in: userEmails } } },
+        { $group: { _id: '$author', count: { $sum: 1 } } },
+      ])
+      .toArray();
+
+    const countMap = new Map<string, number>();
+    blueprintCounts.forEach((b: any) => {
+      if (b._id) countMap.set(String(b._id).toLowerCase(), b.count);
+    });
+
+    const mappedUsers = users.map((u: any) => {
+      const email = String(u.email || '').toLowerCase();
+      return {
+        _id: String(u._id),
+        name: u.name || 'Anonymous User',
+        email: u.email,
+        image: u.image || null,
+        role: String(u.role || u.plan || 'free').toLowerCase(),
+        plan: String(u.plan || u.role || 'free').toLowerCase(),
+        isGenerationBlocked: Boolean(u.isGenerationBlocked),
+        blueprintCount: countMap.get(email) || 0,
+        createdAt: u.createdAt || null,
+      };
+    });
+
+    const [freeUsers, proUsers, blockedUsers, totalBlueprints] = await Promise.all([
+      userCollection.countDocuments({
+        $or: [{ role: 'free' }, { role: 'user' }, { plan: 'free' }],
+      }),
+      userCollection.countDocuments({
+        $or: [{ role: 'pro' }, { plan: 'pro' }],
+      }),
+      userCollection.countDocuments({ isGenerationBlocked: true }),
+      blueprintCollection.countDocuments(),
+    ]);
+
+    res.status(200).json({
+      success: true,
+      users: mappedUsers,
+      total,
+      totalPages,
+      page,
+      limit,
+      stats: {
+        freeUsers,
+        proUsers,
+        blockedUsers,
+        totalBlueprints,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to fetch admin users:', error);
+    res.status(500).json({ error: 'Failed to fetch user list' });
+  }
+});
+
+// Soft-block toggle for blueprint generation
+app.patch('/api/admin/users/:id/block', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
+  try {
+    const rawId = req.params.id;
+    const id = Array.isArray(rawId) ? rawId[0] : String(rawId || '');
+    const { isBlocked } = req.body;
+
+    if (typeof isBlocked !== 'boolean') {
+      res.status(400).json({ error: 'isBlocked boolean is required in request body' });
+      return;
+    }
+
+    const filter: any = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { $or: [{ _id: id }, { id }] };
+    const targetUser = await userCollection.findOne(filter);
+    if (!targetUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    // Protect administrator accounts from being blocked
+    if (targetUser.role === 'admin' && isBlocked) {
+      res.status(400).json({ error: 'Cannot block administrator accounts' });
+      return;
+    }
+
+    await userCollection.updateOne(filter, {
+      $set: {
+        isGenerationBlocked: isBlocked,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      userId: id,
+      isGenerationBlocked: isBlocked,
+      message: isBlocked ? 'User blueprint generation has been blocked' : 'User blueprint generation has been unblocked',
+    });
+  } catch (error) {
+    console.error('Failed to update user block status:', error);
+    res.status(500).json({ error: 'Failed to update user block status' });
+  }
+});
+
+// User role toggle (Free ↔ Pro)
+app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
+  try {
+    const rawId = req.params.id;
+    const id = Array.isArray(rawId) ? rawId[0] : String(rawId || '');
+    const { role } = req.body;
+
+    if (!['free', 'pro'].includes(String(role).toLowerCase())) {
+      res.status(400).json({ error: 'Role must be either free or pro' });
+      return;
+    }
+
+    const targetRole = String(role).toLowerCase();
+    const filter: any = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { $or: [{ _id: id }, { id }] };
+    const targetUser = await userCollection.findOne(filter);
+    if (!targetUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    // Protect administrator accounts from role mutation
+    if (targetUser.role === 'admin') {
+      res.status(400).json({ error: 'Cannot alter role of administrator account' });
+      return;
+    }
+
+    await userCollection.updateOne(filter, {
+      $set: {
+        role: targetRole,
+        plan: targetRole,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      userId: id,
+      role: targetRole,
+      plan: targetRole,
+      message: `User plan updated to ${targetRole.toUpperCase()}`,
+    });
+  } catch (error) {
+    console.error('Failed to update user role:', error);
+    res.status(500).json({ error: 'Failed to update user role' });
+  }
+});
+
+// Get all transaction history with pagination
+app.get('/api/admin/transactions', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
+  try {
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '10'), 10)));
+
+    const total = await transactionCollection.countDocuments();
+    const totalPages = Math.ceil(total / limit) || 1;
+
+    const transactions = await transactionCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray();
+
+    const mappedTransactions = transactions.map((t: any) => ({
+      _id: String(t._id),
+      transactionId: t.transactionId || 'N/A',
+      userEmail: t.userEmail || 'unknown',
+      amount: Number(t.amount) || 0,
+      currency: t.currency || 'USD',
+      planName: t.planName || 'Archflow Pro Subscription',
+      createdAt: t.createdAt || null,
+    }));
+
+    const revenueAgg = await transactionCollection
+      .aggregate([
+        { $group: { _id: null, totalAmount: { $sum: '$amount' } } },
+      ])
+      .toArray();
+    const totalAmount = revenueAgg[0]?.totalAmount || 0;
+
+    res.status(200).json({
+      success: true,
+      transactions: mappedTransactions,
+      total,
+      totalPages,
+      page,
+      limit,
+      stats: {
+        totalAmount: Math.round(totalAmount * 100) / 100,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to fetch transactions:', error);
+    res.status(500).json({ error: 'Failed to fetch transaction history' });
+  }
+});
+
+// Get all blueprints with search, visibility filter, and pagination
+app.get('/api/admin/blueprints', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
+  try {
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const limit = Math.max(1, Math.min(100, parseInt(String(req.query.limit || '10'), 10)));
+    const search = String(req.query.search || '').trim();
+    const visibility = String(req.query.visibility || '').trim().toLowerCase();
+
+    const andConditions: any[] = [];
+
+    if (search) {
+      andConditions.push({
+        $or: [
+          { title: { $regex: search, $options: 'i' } },
+          { author: { $regex: search, $options: 'i' } },
+          { email: { $regex: search, $options: 'i' } },
+          { description: { $regex: search, $options: 'i' } },
+        ],
+      });
+    }
+
+    if (visibility && visibility !== 'all') {
+      andConditions.push({ visibility });
+    }
+
+    const query = andConditions.length > 0 ? (andConditions.length > 1 ? { $and: andConditions } : andConditions[0]) : {};
+
+    const total = await blueprintCollection.countDocuments(query);
+    const totalPages = Math.ceil(total / limit) || 1;
+
+    const blueprints = await blueprintCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray();
+
+    const mappedBlueprints = blueprints.map((b: any) => ({
+      _id: String(b._id),
+      title: b.title || 'Untitled Blueprint',
+      description: b.description || '',
+      author: b.author || b.email || 'Anonymous',
+      email: b.email || b.author || '',
+      visibility: b.visibility || 'public',
+      rating: Number(b.rating) || 0,
+      ratingsCount: Number(b.ratingsCount) || 0,
+      views: Number(b.views) || 0,
+      downloads: Number(b.downloads) || 0,
+      complexity: b.complexity || b.complexcity || 'Medium',
+      teckStack: Array.isArray(b.teckStack)
+        ? b.teckStack
+        : (typeof b.teckStack === 'string'
+          ? b.teckStack.split(',').map((s: string) => s.trim())
+          : []),
+      createdAt: b.createdAt || null,
+    }));
+
+    res.status(200).json({
+      success: true,
+      blueprints: mappedBlueprints,
+      total,
+      totalPages,
+      page,
+      limit,
+    });
+  } catch (error) {
+    console.error('Failed to fetch admin blueprints:', error);
+    res.status(500).json({ error: 'Failed to fetch blueprints' });
+  }
+});
+
+// Admin toggle blueprint visibility (public / private)
+app.patch('/api/admin/blueprints/:id/visibility', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
+  try {
+    const rawId = req.params.id;
+    const id = Array.isArray(rawId) ? rawId[0] : String(rawId || '');
+    const { visibility } = req.body;
+
+    if (!['public', 'private'].includes(String(visibility).toLowerCase())) {
+      res.status(400).json({ error: 'Visibility must be either public or private' });
+      return;
+    }
+
+    const filter: any = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { $or: [{ _id: id }, { id }] };
+    const result = await blueprintCollection.updateOne(filter, {
+      $set: {
+        visibility: String(visibility).toLowerCase(),
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    if (result.matchedCount === 0) {
+      res.status(404).json({ error: 'Blueprint not found' });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      blueprintId: id,
+      visibility,
+      message: `Blueprint visibility updated to ${visibility}`,
+    });
+  } catch (error) {
+    console.error('Failed to update blueprint visibility:', error);
+    res.status(500).json({ error: 'Failed to update blueprint visibility' });
+  }
+});
+
+// Admin delete blueprint (purge)
+app.delete('/api/admin/blueprints/:id', verifyToken, verifyAdmin, async (req: Request, res: Response) => {
+  try {
+    const rawId = req.params.id;
+    const id = Array.isArray(rawId) ? rawId[0] : String(rawId || '');
+
+    const filter: any = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { $or: [{ _id: id }, { id }] };
+    const result = await blueprintCollection.deleteOne(filter);
+
+    if (result.deletedCount === 0) {
+      res.status(404).json({ error: 'Blueprint not found' });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      blueprintId: id,
+      message: 'Blueprint permanently deleted',
+    });
   } catch (error) {
     console.error('Failed to delete blueprint:', error);
     res.status(500).json({ error: 'Failed to delete blueprint' });
