@@ -8,17 +8,36 @@ import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
 dotenv.config();
 
 const app = express();
-app.use(cors());
 
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
+const INTERNAL_SECRET = process.env.INTERNAL_SERVER_SECRET || 'archflow-internal-secure-comm';
+
+const allowedOrigins = [
+  CLIENT_URL,
+  'http://localhost:3000',
+  'https://archflow-web-ai.vercel.app',
+  'https://archflow-client.vercel.app',
+].filter(Boolean) as string[];
 
 app.use(
   cors({
-    origin: [CLIENT_URL, 'http://localhost:3000', 'https://archflow-client.vercel.app'].filter(Boolean),
+    origin: (origin, callback) => {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin) ||
+        allowedOrigins.includes(origin.replace(/\/$/, ''))
+      ) {
+        return callback(null, true);
+      }
+      return callback(new Error('Blocked by CORS policy'));
+    },
     credentials: true,
   })
 );
 app.use(express.json());
+
+// Helper function to safely escape regex input to prevent ReDoS / NoSQL injection
+const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // JWKS remote key set setup (fetches public keys from Next.js better-auth JWKS endpoint)
 const JWKS = createRemoteJWKSet(new URL(`${CLIENT_URL}/api/auth/jwks`));
@@ -41,10 +60,16 @@ export const verifyToken = async (req: Request, res: Response, next: any) => {
     }
   }
 
-  // Fallback: identity forwarded from Next.js server actions / server components
+  // Fallback: identity forwarded from Next.js server actions with internal signature verification
   const forwardEmail = req.headers['x-user-email'];
   const forwardId = req.headers['x-user-id'];
+  const internalSecret = req.headers['x-internal-secret'];
+
   if (forwardEmail || forwardId) {
+    if (internalSecret !== INTERNAL_SECRET) {
+      res.status(401).json({ error: 'Unauthorized: Invalid internal signature' });
+      return;
+    }
     (req as any).user = {
       email: forwardEmail ? String(forwardEmail).toLowerCase() : undefined,
       id: forwardId ? String(forwardId) : undefined,
@@ -155,29 +180,32 @@ app.get('/api/all-blueprints', async (req: Request, res: Response) => {
     const andConditions: any[] = [{ visibility: { $ne: 'private' } }];
 
     if (search) {
+      const safeSearch = escapeRegex(search);
       andConditions.push({
         $or: [
-          { title: { $regex: search, $options: 'i' } },
-          { description: { $regex: search, $options: 'i' } },
-          { prompt: { $regex: search, $options: 'i' } },
+          { title: { $regex: safeSearch, $options: 'i' } },
+          { description: { $regex: safeSearch, $options: 'i' } },
+          { prompt: { $regex: safeSearch, $options: 'i' } },
         ],
       });
     }
 
     if (stack && stack.toLowerCase() !== 'all') {
+      const safeStack = escapeRegex(stack);
       andConditions.push({
         $or: [
-          { teckStack: { $regex: stack, $options: 'i' } },
-          { stack: { $regex: stack, $options: 'i' } },
+          { teckStack: { $regex: safeStack, $options: 'i' } },
+          { stack: { $regex: safeStack, $options: 'i' } },
         ],
       });
     }
 
     if (complexity && complexity.toLowerCase() !== 'all') {
+      const safeComplexity = escapeRegex(complexity);
       andConditions.push({
         $or: [
-          { complexcity: { $regex: `^${complexity}$`, $options: 'i' } },
-          { complexity: { $regex: `^${complexity}$`, $options: 'i' } },
+          { complexcity: { $regex: `^${safeComplexity}$`, $options: 'i' } },
+          { complexity: { $regex: `^${safeComplexity}$`, $options: 'i' } },
         ],
       });
     }
@@ -1046,14 +1074,15 @@ app.get('/api/my-blueprints/:email', verifyToken, async (req: Request, res: Resp
 
     let query: any = ownershipCondition;
     if (search) {
+      const safeSearch = escapeRegex(search);
       query = {
         $and: [
           ownershipCondition,
           {
             $or: [
-              { title: { $regex: search, $options: 'i' } },
-              { description: { $regex: search, $options: 'i' } },
-              { prompt: { $regex: search, $options: 'i' } },
+              { title: { $regex: safeSearch, $options: 'i' } },
+              { description: { $regex: safeSearch, $options: 'i' } },
+              { prompt: { $regex: safeSearch, $options: 'i' } },
             ],
           },
         ],
@@ -1197,10 +1226,11 @@ app.get('/api/admin/users', verifyToken, verifyAdmin, async (req: Request, res: 
     const andConditions: any[] = [];
 
     if (search) {
+      const safeSearch = escapeRegex(search);
       andConditions.push({
         $or: [
-          { name: { $regex: search, $options: 'i' } },
-          { email: { $regex: search, $options: 'i' } },
+          { name: { $regex: safeSearch, $options: 'i' } },
+          { email: { $regex: safeSearch, $options: 'i' } },
         ],
       });
     }
@@ -1225,7 +1255,7 @@ app.get('/api/admin/users', verifyToken, verifyAdmin, async (req: Request, res: 
     const totalPages = Math.ceil(total / limit) || 1;
 
     const users = await userCollection
-      .find(query, { projection: { password: 0 } })
+      .find(query, { projection: { password: 0, customApiKey: 0 } })
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
@@ -1407,20 +1437,22 @@ app.get('/api/admin/transactions', verifyToken, verifyAdmin, async (req: Request
     const andConditions: any[] = [];
 
     if (search) {
+      const safeSearch = escapeRegex(search);
       andConditions.push({
         $or: [
-          { userEmail: { $regex: search, $options: 'i' } },
-          { transactionId: { $regex: search, $options: 'i' } },
-          { planName: { $regex: search, $options: 'i' } },
+          { userEmail: { $regex: safeSearch, $options: 'i' } },
+          { transactionId: { $regex: safeSearch, $options: 'i' } },
+          { planName: { $regex: safeSearch, $options: 'i' } },
         ],
       });
     }
 
     if (plan && plan !== 'all') {
+      const safePlan = escapeRegex(plan);
       andConditions.push({
         $or: [
-          { planName: { $regex: plan, $options: 'i' } },
-          { plan: { $regex: plan, $options: 'i' } },
+          { planName: { $regex: safePlan, $options: 'i' } },
+          { plan: { $regex: safePlan, $options: 'i' } },
         ],
       });
     }
@@ -1502,12 +1534,13 @@ app.get('/api/admin/blueprints', verifyToken, verifyAdmin, async (req: Request, 
     const andConditions: any[] = [];
 
     if (search) {
+      const safeSearch = escapeRegex(search);
       andConditions.push({
         $or: [
-          { title: { $regex: search, $options: 'i' } },
-          { author: { $regex: search, $options: 'i' } },
-          { email: { $regex: search, $options: 'i' } },
-          { description: { $regex: search, $options: 'i' } },
+          { title: { $regex: safeSearch, $options: 'i' } },
+          { author: { $regex: safeSearch, $options: 'i' } },
+          { email: { $regex: safeSearch, $options: 'i' } },
+          { description: { $regex: safeSearch, $options: 'i' } },
         ],
       });
     }
