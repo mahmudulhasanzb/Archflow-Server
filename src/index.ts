@@ -661,6 +661,26 @@ app.get('/api/user/quota/:email', verifyToken, async (req: Request, res: Respons
 
     const isPro = role === 'pro';
 
+    const hasCustomKey = Boolean(user?.customApiKey && typeof user.customApiKey === 'string' && user.customApiKey.trim().length > 0);
+
+    if (hasCustomKey) {
+      res.status(200).json({
+        role: role,
+        plan: role,
+        isPro: isPro || isAdmin,
+        isAdmin: isAdmin,
+        isBlocked: false,
+        count: 0,
+        max: 999999,
+        remaining: 999999,
+        canGenerate: true,
+        unlimited: true,
+        hasCustomKey: true,
+        apiKeyLabel: user?.apiKeyLabel || 'Custom OpenRouter Key',
+      });
+      return;
+    }
+
     if (isPro) {
       // Pro: Max 10 per 24 hours
       const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -710,6 +730,204 @@ app.get('/api/user/quota/:email', verifyToken, async (req: Request, res: Respons
   }
 });
 
+// ── OpenRouter Custom API Key Management (BYOK) ──────────────────────
+
+// Save / Update user custom OpenRouter API key (protected with verifyToken)
+app.post('/api/user/api-key', verifyToken, async (req: Request, res: Response) => {
+  try {
+    const userPayload = (req as any).user;
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+    const userId = userPayload?.id || userPayload?.sub || '';
+
+    if (!userEmail && !userId) {
+      res.status(401).json({ error: 'Unauthorized: User identity missing' });
+      return;
+    }
+
+    const { apiKey } = req.body;
+    if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length < 10) {
+      res.status(400).json({ error: 'Please provide a valid OpenRouter API key' });
+      return;
+    }
+
+    const cleanKey = apiKey.trim();
+
+    // Verify key against OpenRouter API
+    try {
+      const orRes = await fetch('https://openrouter.ai/api/v1/auth/key', {
+        headers: {
+          Authorization: `Bearer ${cleanKey}`,
+        },
+      });
+
+      if (!orRes.ok) {
+        if (orRes.status === 401) {
+          res.status(400).json({
+            error: 'Invalid OpenRouter API key. Please verify your key at openrouter.ai/keys',
+          });
+          return;
+        }
+        res.status(400).json({
+          error: `OpenRouter key verification failed (Status: ${orRes.status})`,
+        });
+        return;
+      }
+
+      const orData = await orRes.json();
+      const keyInfo = orData?.data || {};
+
+      let userFilter: any = { email: userEmail };
+      if (userId && ObjectId.isValid(userId)) {
+        userFilter = { $or: [{ email: userEmail }, { _id: new ObjectId(userId) }, { _id: userId }] };
+      }
+
+      await userCollection.updateOne(userFilter, {
+        $set: {
+          customApiKey: cleanKey,
+          apiKeyLabel: keyInfo.label || 'Custom Key',
+          apiKeyCreatedAt: new Date().toISOString(),
+        },
+      });
+
+      res.status(200).json({
+        success: true,
+        message: 'OpenRouter API key verified and connected successfully.',
+        keyData: {
+          label: keyInfo.label || 'Custom Key',
+          usage: keyInfo.usage ?? 0,
+          limit: keyInfo.limit ?? null,
+          limit_remaining: keyInfo.limit_remaining ?? null,
+          is_free_tier: Boolean(keyInfo.is_free_tier),
+        },
+      });
+    } catch (fetchErr: any) {
+      console.error('Failed to communicate with OpenRouter API:', fetchErr);
+      res.status(502).json({
+        error: 'Unable to reach OpenRouter to verify the API key. Please try again in a few moments.',
+      });
+    }
+  } catch (err) {
+    console.error('Failed to save API key:', err);
+    res.status(500).json({ error: 'Internal server error while saving API key' });
+  }
+});
+
+// Get user custom OpenRouter API key status & real-time balance (protected with verifyToken)
+app.get('/api/user/api-key', verifyToken, async (req: Request, res: Response) => {
+  try {
+    const userPayload = (req as any).user;
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+    const userId = userPayload?.id || userPayload?.sub || '';
+
+    if (!userEmail && !userId) {
+      res.status(401).json({ error: 'Unauthorized: User identity missing' });
+      return;
+    }
+
+    let userFilter: any = { email: userEmail };
+    if (userId && ObjectId.isValid(userId)) {
+      userFilter = { $or: [{ email: userEmail }, { _id: new ObjectId(userId) }, { _id: userId }] };
+    }
+
+    const user = await userCollection.findOne(userFilter);
+    const customKey = user?.customApiKey;
+
+    if (!customKey || typeof customKey !== 'string' || customKey.trim().length === 0) {
+      res.status(200).json({ hasCustomKey: false });
+      return;
+    }
+
+    const trimmedKey = customKey.trim();
+    // Mask key for safety (show first 8 chars and last 4 chars)
+    const maskedKey = trimmedKey.length > 14
+      ? `${trimmedKey.slice(0, 8)}••••••••${trimmedKey.slice(-4)}`
+      : '••••••••••••';
+
+    // Fetch live credit / balance info from OpenRouter
+    try {
+      const orRes = await fetch('https://openrouter.ai/api/v1/auth/key', {
+        headers: {
+          Authorization: `Bearer ${trimmedKey}`,
+        },
+      });
+
+      if (!orRes.ok) {
+        if (orRes.status === 401) {
+          res.status(200).json({
+            hasCustomKey: true,
+            apiKey: maskedKey,
+            rawKey: trimmedKey,
+            isValid: false,
+            error: 'Key was revoked or expired on OpenRouter',
+          });
+          return;
+        }
+      }
+
+      const orData = await orRes.json();
+      const keyInfo = orData?.data || {};
+
+      res.status(200).json({
+        hasCustomKey: true,
+        apiKey: maskedKey,
+        rawKey: trimmedKey,
+        label: keyInfo.label || user.apiKeyLabel || 'Custom Key',
+        usage: keyInfo.usage ?? 0,
+        limit: keyInfo.limit ?? null,
+        limit_remaining: keyInfo.limit_remaining ?? null,
+        is_free_tier: Boolean(keyInfo.is_free_tier),
+        isValid: true,
+      });
+    } catch (fetchErr) {
+      res.status(200).json({
+        hasCustomKey: true,
+        apiKey: maskedKey,
+        rawKey: trimmedKey,
+        label: user.apiKeyLabel || 'Custom Key',
+        isValid: true,
+      });
+    }
+  } catch (err) {
+    console.error('Failed to get API key status:', err);
+    res.status(500).json({ error: 'Internal server error checking API key status' });
+  }
+});
+
+// Delete / Disconnect user custom OpenRouter API key (protected with verifyToken)
+app.delete('/api/user/api-key', verifyToken, async (req: Request, res: Response) => {
+  try {
+    const userPayload = (req as any).user;
+    const userEmail = userPayload?.email ? String(userPayload.email).toLowerCase() : '';
+    const userId = userPayload?.id || userPayload?.sub || '';
+
+    if (!userEmail && !userId) {
+      res.status(401).json({ error: 'Unauthorized: User identity missing' });
+      return;
+    }
+
+    let userFilter: any = { email: userEmail };
+    if (userId && ObjectId.isValid(userId)) {
+      userFilter = { $or: [{ email: userEmail }, { _id: new ObjectId(userId) }, { _id: userId }] };
+    }
+
+    await userCollection.updateOne(userFilter, {
+      $unset: {
+        customApiKey: '',
+        apiKeyLabel: '',
+        apiKeyCreatedAt: '',
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Custom OpenRouter API key removed. Returned to standard plan.',
+    });
+  } catch (err) {
+    console.error('Failed to remove API key:', err);
+    res.status(500).json({ error: 'Internal server error while removing API key' });
+  }
+});
+
 // post blueprint (protected with verifyToken + quota enforcement)
 app.post('/api/blueprints', verifyToken, async (req: Request, res: Response) => {
   try {
@@ -743,9 +961,10 @@ app.post('/api/blueprints', verifyToken, async (req: Request, res: Response) => 
     }
 
     const isPro = role === 'pro' || isAdmin;
+    const hasCustomKey = Boolean(user?.customApiKey && typeof user.customApiKey === 'string' && user.customApiKey.trim().length > 0);
 
-    // Enforce quotas
-    if (!isAdmin) {
+    // Enforce quotas (skipped if admin OR if user has connected their own OpenRouter API key)
+    if (!isAdmin && !hasCustomKey) {
       if (role === 'pro') {
         const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         const dailyCount = await blueprintCollection.countDocuments({
